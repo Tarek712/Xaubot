@@ -19,26 +19,24 @@ from fastapi.responses import HTMLResponse
 # ==============================================================================
 DB_PATH = os.getenv("BOT_DB_PATH", "autonomous_memory.db")
 
-# إعدادات تلغرام الافتراضية من متغيرات البيئة (ويمكن تعديلها وحفظها حياً من الواجهة)
 DEFAULT_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# --- مصدر السعر: CFD الذهب الفوري XAU/USD من Swissquote (Bid/Ask حقيقي، بلا مفتاح) ---
 SQ_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
-SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()  # standard | premium | prime
-POLL_S = 2.0                     # تكرار جلب السعر (ثوانٍ)
-STALE_QUOTE_S = 120              # أكبر عمر مقبول للسعر قبل اعتبار السوق مغلقاً
-TF_MIN = int(os.getenv("BOT_TF_MIN", "1"))  # الإطار الزمني بالدقائق: 1 | 5 | 15
+SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()
+POLL_S = 2.0
+STALE_QUOTE_S = 120
+TF_MIN = int(os.getenv("BOT_TF_MIN", "1"))
 _YF = {1: "1m", 5: "5m", 15: "15m"}
 if TF_MIN not in _YF:
     raise SystemExit("BOT_TF_MIN must be one of 1, 5, 15")
 YF_INTERVAL = _YF[TF_MIN]
 TF_SEC = TF_MIN * 60
-MIN_CANDLES = 50                 # أقل عدد شموع قبل بدء التحليل
-MAX_SPREAD = 2.0                 # لا دخول إذا اتسع السبريد فوق هذا ($)
-ASSUMED_SPREAD = 0.25            # سبريد ثابت افتراضي ($) للتداول الورقي عند غياب الفارق
-ENTRY_CONFIDENCE = 82.0          # الحد الأدنى للقناعة للدخول
-SIGNAL_CONFIRM = 2               # عدد الشموع المغلقة المتتالية لتأكيد الإشارة قبل الدخول
+MIN_CANDLES = 50
+MAX_SPREAD = 2.0
+ASSUMED_SPREAD = 0.25
+ENTRY_CONFIDENCE = 82.0
+SIGNAL_CONFIRM = 2
 COOLDOWN_AFTER_WIN_S = 120 * TF_MIN
 COOLDOWN_AFTER_LOSS_S = 300 * TF_MIN
 MAX_CONSECUTIVE_LOSSES = 4
@@ -56,7 +54,6 @@ def today_utc_str() -> str:
 
 
 def get_active_session() -> Dict[str, str]:
-    """تحديد جلسة التداول الحالية بتوقيت UTC وتأثيرها على سيولة الذهب."""
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour + now_utc.minute / 60.0
     if 21.0 <= h < 22.1:
@@ -94,7 +91,6 @@ def init_db():
                 trade_date TEXT
             )
         """)
-        # ترقية تلقائية إذا كان الجدول قديماً بدون عمود trade_date
         c.execute("PRAGMA table_info(trade_history)")
         cols = [row[1] for row in c.fetchall()]
         if "trade_date" not in cols:
@@ -283,11 +279,11 @@ class AutonomousQuantitativeBrain:
         self.tg = tg
         self.bot_active: bool = True
         self.can_trade: bool = False
-        self.lot_mode: str = "FIXED_001"  # FIXED_001 (0.01 ثابت) | DYNAMIC_RISK
-        self.balance: float = 10000.0
-        self.equity: float = 10000.0
-        self.initial_balance: float = 10000.0
-        self.peak_balance: float = 10000.0
+        self.lot_mode: str = "FIXED_001"
+        self.balance: float = 100.0
+        self.equity: float = 100.0
+        self.initial_balance: float = 100.0
+        self.peak_balance: float = 100.0
         self.max_drawdown_pct: float = 0.0
 
         self.candles: deque = deque(maxlen=400)
@@ -296,7 +292,6 @@ class AutonomousQuantitativeBrain:
         self.ask_price: Optional[float] = None
         self.spread: float = ASSUMED_SPREAD
 
-        # المؤشرات الكمية والهيكلية
         self.hurst: float = 0.50
         self.entropy: float = 0.50
         self.velocity: float = 0.0
@@ -333,7 +328,6 @@ class AutonomousQuantitativeBrain:
         self._decision: Dict = {"policy": "CALIBRATING", "direction": 0, "score": 0.0}
         self._restore_state()
 
-    # ----------------------------------------------------------------- الذاكرة
     def _save_runtime_key(self, key: str, val_obj):
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -350,7 +344,6 @@ class AutonomousQuantitativeBrain:
             print("Runtime save error:", repr(e))
 
     def _restore_state(self):
-        """استرجاع الرصيد، الأوزان، الإحصائيات، الصفقة المفتوحة، وإعدادات التلغرام من SQLite."""
         try:
             conn = sqlite3.connect(DB_PATH)
             try:
@@ -413,12 +406,6 @@ class AutonomousQuantitativeBrain:
                         self.tg.last_status = "مُحمّل من الذاكرة الدائمة" if self.tg.is_configured() else "غير مُفعّل"
                     elif k == "last_report_date":
                         self.tg.last_report_date = str(parsed)
-
-                # الربح الجزئي المحجوز لصفقة مفتوحة أُضيف للرصيد سابقاً ولا يظهر في trade_history
-                if self.open_position:
-                    self.balance = round(self.balance + float(self.open_position.get("realized", 0.0)), 2)
-                    self.equity = self.balance
-                    self.peak_balance = max(self.peak_balance, self.balance)
             finally:
                 conn.close()
         except Exception as e:
@@ -446,7 +433,7 @@ class AutonomousQuantitativeBrain:
 
     def build_daily_report_data(self, date_str: Optional[str] = None) -> Dict:
         target_date = date_str or today_utc_str()
-        month_day_prefix = target_date[5:]  # MM-DD للتوافق مع السجلات السابقة
+        month_day_prefix = target_date[5:]
         conn = sqlite3.connect(DB_PATH)
         try:
             c = conn.cursor()
@@ -494,9 +481,7 @@ class AutonomousQuantitativeBrain:
             "text": msg,
         })
 
-    # --------------------------------------------------------------- الإحصاء والرياضيات الكمية
     def compute_hurst_exponent(self, prices: np.ndarray) -> float:
-        """حساب معامل هيرست المصحح باستخدام الفروق اللوغاريتمية المُزال منها الانجراف."""
         if len(prices) < 45:
             return 0.5
         log_p = np.log(np.maximum(prices, 1e-4))
@@ -515,7 +500,6 @@ class AutonomousQuantitativeBrain:
         return round(float(np.clip(poly[0], 0.15, 0.85)), 3)
 
     def compute_shannon_entropy(self, returns: np.ndarray) -> float:
-        """حساب إنتروبيا شانون الحقيقية عبر التعداد الاحتمالي المباشر (density=False) مع تنعيم لابلاس."""
         if len(returns) < 20:
             return 0.75
         std_r = float(np.std(returns))
@@ -529,7 +513,6 @@ class AutonomousQuantitativeBrain:
         return round(float(np.clip(entropy, 0.05, 0.99)), 3)
 
     def compute_true_atr(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-        """حساب متوسط المدى الحقيقي (Wilder's True Range ATR)."""
         if len(closes) < 2:
             return 1.2
         prev_closes = closes[:-1]
@@ -548,7 +531,6 @@ class AutonomousQuantitativeBrain:
     def discover_gravity_and_volume_profile(
         self, opens: np.ndarray, closes: np.ndarray, highs: np.ndarray, lows: np.ndarray
     ):
-        """اكتشاف مناطق الجاذبية/الرفض + حساب Volume Profile التقديري (POC, VAH, VAL)."""
         if len(closes) < 50:
             return
         min_p, max_p = float(np.min(lows)), float(np.max(highs))
@@ -620,7 +602,6 @@ class AutonomousQuantitativeBrain:
     def detect_smc_microstructure(
         self, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray
     ) -> Dict:
-        """رصد هياكل SMC للذهب: سحب السيولة (Liquidity Sweep) والفجوات السعرية العادلة (FVG)."""
         result = {"bull_sweep": False, "bear_sweep": False, "bull_fvg": False, "bear_fvg": False, "label": "NONE"}
         if len(closes) < 25:
             return result
@@ -787,7 +768,6 @@ class AutonomousQuantitativeBrain:
             "smc_event": self.smc_event,
         }
 
-    # ----------------------------------------------------------- دورة القرار
     @staticmethod
     def _rank(history, x: float) -> float:
         arr = np.asarray(history, dtype=float)
@@ -839,12 +819,10 @@ class AutonomousQuantitativeBrain:
             d["confirmed"] = False
 
     async def check_and_send_daily_rollover_report(self):
-        """فحص موعد إغلاق السوق اليومي (21:01 UTC) وإرسال التقرير اليومي التلقائي عبر تلغرام مرة واحدة يومياً."""
         if not self.tg.is_configured():
             return
         now_utc = datetime.now(timezone.utc)
         today_str = now_utc.strftime("%Y-%m-%d")
-        # إغلاق سوق الذهب اليومي يبدأ الساعة 21:00 UTC
         if now_utc.hour == 21 and now_utc.minute >= 1 and self.tg.last_report_date != today_str:
             self.tg.last_report_date = today_str
             self._save_runtime_key("last_report_date", today_str)
@@ -1191,9 +1169,6 @@ tg_notifier = TelegramNotifier()
 brain = AutonomousQuantitativeBrain(tg_notifier)
 
 
-# ==============================================================================
-# 4. محرك بث سعر CFD الذهب الفوري XAU/USD
-# ==============================================================================
 def parse_swissquote(data, profile: str):
     items = data if isinstance(data, list) else [data]
     bids, asks, stamps = [], [], []
@@ -1492,9 +1467,6 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Autonomous XAU/USD Quantitative React Terminal v3", lifespan=lifespan)
 
 
-# ==============================================================================
-# 5. خادم ومتحكم WebSockets
-# ==============================================================================
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -1518,7 +1490,7 @@ async def websocket_endpoint(ws: WebSocket):
                     brain.lot_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED_001" else "FIXED_001"
                     brain._save_runtime_key("lot_mode", brain.lot_mode)
                     mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة ديناميكية %"
-                    brain.log_thought(f"تم تبديل نظام حجم العقد إلى: {mode_lbl}", "SYSTEM")
+                    brain.log_thought(f"تم تبديل حجم العقد إلى: {mode_lbl}", "SYSTEM")
 
                 elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
                     await brain._close_position(
@@ -1566,9 +1538,6 @@ async def websocket_endpoint(ws: WebSocket):
             stream_manager.clients.remove(ws)
 
 
-# ==============================================================================
-# 6. واجهة React 18 المتجاوبة بالكامل للهاتف وسطح المكتب (Mobile-First + Apple Dark UI)
-# ==============================================================================
 HTML_UI = """<!DOCTYPE html>
 <html lang="ar" dir="rtl" class="dark">
 <head>
@@ -1646,7 +1615,6 @@ HTML_UI = """<!DOCTYPE html>
       return map[cat] || "bg-slate-700/40 text-slate-300 border-slate-600/40";
     };
 
-    // مكون شارت TradingView المتجاوب مع الهاتف وسطح المكتب
     function TradingChart({ candles, latestCandle, zones, openPos, poc, vah, val, showZones, showVP }) {
       const containerRef = useRef(null);
       const chartRef = useRef(null);
@@ -1834,8 +1802,8 @@ HTML_UI = """<!DOCTYPE html>
         bid: null,
         ask: null,
         spread: 0.25,
-        balance: 10000,
-        equity: 10000,
+        balance: 100,
+        equity: 100,
         kpis: { win_rate: 0, total_trades: 0, wins: 0, losses: 0, profit_factor: 0, net_pnl: 0, expectancy: 0, max_drawdown_pct: 0 },
         telegram: { enabled: false, configured: false, masked_token: "", chat_id: "", last_status: "غير مرتبط", last_report_date: "" },
         cognition: {
@@ -1855,13 +1823,11 @@ HTML_UI = """<!DOCTYPE html>
       const prevPriceRef = useRef(null);
       const wsRef = useRef(null);
 
-      // حالات التبويب على سطح المكتب والهاتف
       const [showZones, setShowZones] = useState(true);
       const [showVP, setShowVP] = useState(true);
-      const [desktopDockTab, setDesktopDockTab] = useState("POSITION"); // POSITION | HISTORY | TELEGRAM
-      const [mobileNav, setMobileNav] = useState("CHART"); // CHART | CORTEX | LOGS | TELEGRAM
+      const [desktopDockTab, setDesktopDockTab] = useState("POSITION");
+      const [mobileNav, setMobileNav] = useState("CHART");
 
-      // حقول إعدادات تلغرام
       const [tgTokenInput, setTgTokenInput] = useState("");
       const [tgChatInput, setTgChatInput] = useState("");
       const [tgEnabledInput, setTgEnabledInput] = useState(true);
@@ -1942,7 +1908,6 @@ HTML_UI = """<!DOCTYPE html>
         return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
       };
 
-      // مكون فرعي: بطاقة الصفقة النشطة (متجاوب للهاتف وسطح المكتب)
       const renderActivePosition = () => {
         if (!pos) {
           return (
@@ -2009,14 +1974,12 @@ HTML_UI = """<!DOCTYPE html>
         );
       };
 
-      // مكون فرعي: سجل الصفقات (بطاقات على الهاتف + جدول على سطح المكتب)
       const renderTradeHistory = () => {
         if (state.trade_log.length === 0) {
           return <div className="py-6 text-center text-xs text-slate-400">لا توجد صفقات مغلقة في السجل بعد.</div>;
         }
         return (
           <div>
-            {/* عرض البطاقات المدمجة للهاتف */}
             <div className="space-y-2 md:hidden max-h-[380px] overflow-y-auto pr-1">
               {state.trade_log.map((t) => (
                 <div key={t.id} className="glass-pill p-3 space-y-1.5 text-xs">
@@ -2043,7 +2006,6 @@ HTML_UI = """<!DOCTYPE html>
               ))}
             </div>
 
-            {/* عرض الجدول لسطح المكتب */}
             <div className="hidden md:block overflow-x-auto max-h-56">
               <table className="w-full text-right text-xs">
                 <thead className="text-[11px] text-slate-400 border-b border-white/10">
@@ -2078,7 +2040,6 @@ HTML_UI = """<!DOCTYPE html>
         );
       };
 
-      // مكون فرعي: لوحة إعدادات تلغرام والتقرير اليومي
       const renderTelegramSettings = () => (
         <div className="space-y-3 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-2 glass-pill p-3">
@@ -2162,7 +2123,6 @@ HTML_UI = """<!DOCTYPE html>
         </div>
       );
 
-      // مكون فرعي: لوحة القشرة الكمية (Cortex)
       const renderCortexPanel = () => (
         <div className="glass-card p-3.5 sm:p-4 flex flex-col gap-3.5">
           <div className="flex items-center justify-between">
@@ -2255,7 +2215,6 @@ HTML_UI = """<!DOCTYPE html>
         </div>
       );
 
-      // مكون فرعي: مجرى التفكير الحي
       const renderNeuralStream = () => (
         <div className="glass-card p-3.5 sm:p-4 flex-1 flex flex-col min-h-[260px]">
           <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-white/[0.06]">
@@ -2284,10 +2243,7 @@ HTML_UI = """<!DOCTYPE html>
 
       return (
         <div className="min-h-screen flex flex-col p-2.5 sm:p-3.5 lg:p-4 pb-20 lg:pb-4 gap-3 max-w-[1920px] mx-auto select-none">
-
-          {/* 1. الشريط القيادي العلوي المتجاوب (Mobile-First Command Header) */}
           <header className="glass-card p-3 flex flex-col gap-2.5">
-            {/* الصف الأول: الهوية + السعر اللحظي + أزرار التحكم السريعة */}
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2.5">
                 <div className="relative flex items-center justify-center w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-amber-500/10 border border-amber-500/25 shrink-0">
@@ -2307,7 +2263,6 @@ HTML_UI = """<!DOCTYPE html>
                 </div>
               </div>
 
-              {/* السعر والسبريد */}
               <div className="flex items-center gap-2.5">
                 <div className="text-left sm:text-right">
                   <div className={`text-xl sm:text-2xl font-extrabold transition-colors duration-200 mono ${priceFlash}`}>
@@ -2318,7 +2273,6 @@ HTML_UI = """<!DOCTYPE html>
                   </div>
                 </div>
 
-                {/* أزرار التحكم المدمجة */}
                 <div className="flex items-center gap-1.5">
                   <button
                     onClick={() => sendCommand('TOGGLE_LOT_MODE')}
@@ -2348,7 +2302,6 @@ HTML_UI = """<!DOCTYPE html>
               </div>
             </div>
 
-            {/* الصف الثاني: شريط المؤشرات المالية القابل للتمرير الأفقي على الهاتف */}
             <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1 border-t border-white/[0.05]">
               <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
                 <div className="text-[9px] text-slate-400">الرصيد (Balance)</div>
@@ -2389,10 +2342,8 @@ HTML_UI = """<!DOCTYPE html>
             </div>
           </header>
 
-          {/* 2. عرض سطح المكتب الكامل (Desktop 12-Col Bento Grid) */}
           <div className="hidden lg:grid lg:grid-cols-12 gap-3.5 flex-1">
             <div className="lg:col-span-8 flex flex-col gap-3.5">
-              {/* بطاقة الشارت */}
               <div className="glass-card p-3.5 flex-1 flex flex-col">
                 <div className="flex items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.06]">
                   <div className="flex items-center gap-2.5">
@@ -2438,7 +2389,6 @@ HTML_UI = """<!DOCTYPE html>
                 />
               </div>
 
-              {/* منصة التبويبات السفلية لسطح المكتب */}
               <div className="glass-card p-4">
                 <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-white/[0.06]">
                   <div className="flex items-center gap-1.5">
@@ -2481,7 +2431,6 @@ HTML_UI = """<!DOCTYPE html>
             </div>
           </div>
 
-          {/* 3. عرض الهاتف والأجهزة اللوحية الذكي (Mobile Tabbed Views) */}
           <div className="flex lg:hidden flex-col gap-3 flex-1">
             {mobileNav === "CHART" && (
               <>
@@ -2525,7 +2474,6 @@ HTML_UI = """<!DOCTYPE html>
                   />
                 </div>
 
-                {/* بطاقة حالة الوكيل السريعة + الصفقة النشطة تحت الشارت مباشرة على الهاتف */}
                 <div className="glass-card p-3.5">
                   <div className="flex items-center justify-between mb-2 pb-2 border-b border-white/[0.06]">
                     <span className="text-xs font-bold text-amber-400">الصفقة النشطة وحالة القرار</span>
@@ -2561,7 +2509,6 @@ HTML_UI = """<!DOCTYPE html>
             )}
           </div>
 
-          {/* 4. شريط التنقل السفلي العائم للهاتف (iOS Style Bottom Tab Bar) */}
           <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#090D15]/95 backdrop-blur-xl border-t border-white/10 px-2 py-1.5 flex items-center justify-around">
             <button
               onClick={() => setMobileNav("CHART")}
@@ -2600,7 +2547,6 @@ HTML_UI = """<!DOCTYPE html>
               <span>التلغرام</span>
             </button>
           </nav>
-
         </div>
       );
     }
