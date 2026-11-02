@@ -19,6 +19,10 @@ from fastapi.responses import HTMLResponse
 # ==============================================================================
 DB_PATH = os.getenv("BOT_DB_PATH", "autonomous_memory.db")
 
+# إعدادات تلغرام الافتراضية من متغيرات البيئة (ويمكن تعديلها وحفظها حياً من الواجهة)
+DEFAULT_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
 # --- مصدر السعر: CFD الذهب الفوري XAU/USD من Swissquote (Bid/Ask حقيقي، بلا مفتاح) ---
 SQ_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
 SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()  # standard | premium | prime
@@ -47,12 +51,16 @@ def stamp() -> str:
     return datetime.now(timezone.utc).strftime("%m-%d %H:%M:%S")
 
 
+def today_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def get_active_session() -> Dict[str, str]:
     """تحديد جلسة التداول الحالية بتوقيت UTC وتأثيرها على سيولة الذهب."""
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour + now_utc.minute / 60.0
     if 21.0 <= h < 22.1:
-        return {"name": "DAILY_ROLLOVER", "label": "توقف السيولة اليومي (Rollover)", "bias": "HOLD"}
+        return {"name": "DAILY_ROLLOVER", "label": "إغلاق/توقف السيولة اليومي (Rollover)", "bias": "HOLD"}
     if 13.0 <= h < 17.0:
         return {"name": "LDN_NY_OVERLAP", "label": "تداخل لندن ونيويورك (ذروة السيولة)", "bias": "MOMENTUM"}
     if 7.0 <= h < 13.0:
@@ -82,9 +90,16 @@ def init_db():
                 reason_entry TEXT,
                 reason_exit TEXT,
                 opened_at TEXT,
-                closed_at TEXT
+                closed_at TEXT,
+                trade_date TEXT
             )
         """)
+        # ترقية تلقائية إذا كان الجدول قديماً بدون عمود trade_date
+        c.execute("PRAGMA table_info(trade_history)")
+        cols = [row[1] for row in c.fetchall()]
+        if "trade_date" not in cols:
+            c.execute("ALTER TABLE trade_history ADD COLUMN trade_date TEXT")
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS memory_lessons (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +127,189 @@ init_db()
 
 
 # ==============================================================================
-# 2. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex)
+# 2. محرك إشعارات وتقارير تلغرام غير المتزامن (Telegram Notification Engine)
+# ==============================================================================
+class TelegramNotifier:
+    def __init__(self):
+        self.bot_token: str = DEFAULT_TG_TOKEN
+        self.chat_id: str = DEFAULT_TG_CHAT_ID
+        self.enabled: bool = bool(self.bot_token and self.chat_id)
+        self.last_report_date: str = ""
+        self.last_status: str = "جاهز للربط" if not self.enabled else "مُفعّل وجاهز"
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _http(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=8.0)
+        return self._client
+
+    async def aclose(self):
+        if self._client is not None:
+            await self._client.aclose()
+
+    def is_configured(self) -> bool:
+        return bool(self.enabled and self.bot_token.strip() and self.chat_id.strip())
+
+    def masked_token(self) -> str:
+        t = self.bot_token.strip()
+        if len(t) <= 10:
+            return t
+        return f"{t[:6]}...{t[-4:]}"
+
+    async def send_html(self, text: str, force: bool = False) -> bool:
+        if not force and not self.is_configured():
+            return False
+        token = self.bot_token.strip()
+        cid = self.chat_id.strip()
+        if not token or not cid:
+            self.last_status = "خطأ: التوكن أو معرف المحادثة فارغ"
+            return False
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": cid,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            r = await self._http().post(url, json=payload)
+            if r.status_code == 200:
+                self.last_status = f"تم الإرسال بنجاح ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)"
+                return True
+            err_desc = r.json().get("description", f"HTTP {r.status_code}")
+            self.last_status = f"فشل الإرسال: {err_desc}"
+            return False
+        except Exception as e:
+            self.last_status = f"خطأ اتصال بتلغرام: {repr(e)}"
+            return False
+
+    async def notify_entry(self, pos: Dict, session_label: str):
+        if not self.is_configured():
+            return
+        icon = "🟢" if pos["side"] == "BUY" else "🔴"
+        direction_ar = "شراء (BUY)" if pos["side"] == "BUY" else "بيع (SELL)"
+        msg = (
+            f"{icon} <b>دخول صفقة ذهب جديدة | XAU/USD</b>
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})
+"
+            f"📦 <b>حجم العقد:</b> <code>{pos['lots']} Lot</code>
+"
+            f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>
+"
+            f"🛡️ <b>الوقف الهيكلي (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})
+"
+            f"🏆 <b>الهدف الهيكلي (TP):</b> <code>${pos['tp']:.2f}</code>
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"🧠 <b>القناعة الكمية:</b> <code>{pos['confidence']}%</code>
+"
+            f"⚙️ <b>السياسة:</b> <code>{pos['policy']}</code>
+"
+            f"📊 <b>حالة السوق:</b> <code>{pos['regime']}</code>
+"
+            f"🌍 <b>الجلسة:</b> {session_label}
+"
+            f"🕒 <b>التوقيت:</b> <code>{pos['opened_at']} UTC</code>"
+        )
+        await self.send_html(msg)
+
+    async def notify_secured(self, pos: Dict, note: str):
+        if not self.is_configured():
+            return
+        msg = (
+            f"🛡️ <b>تأمين صفقة نشطة | XAU/USD (#{pos['id']})</b>
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"📌 <b>النوع:</b> <code>{pos['side']} ({pos['lots']}L)</code>
+"
+            f"🔒 <b>الوقف المحدث (SL):</b> <code>${pos['sl']:.2f}</code>
+"
+            f"💵 <b>الربح المحجوز/الجزئي:</b> <code>${pos['realized']:+.2f}</code>
+"
+            f"📝 <b>التفاصيل:</b> {note}"
+        )
+        await self.send_html(msg)
+
+    async def notify_exit(self, rec: Dict, r_mult: float, balance: float, kpis: Dict):
+        if not self.is_configured():
+            return
+        win = rec["pnl"] >= 0
+        badge = "✅ <b>إغلاق صفقة رابحة</b>" if win else "❌ <b>إغلاق صفقة خاسرة</b>"
+        pnl_str = f"+${rec['pnl']:.2f}" if win else f"-${abs(rec['pnl']):.2f}"
+        r_str = f"{r_mult:+.2f}R"
+        msg = (
+            f"{badge} | <b>XAU/USD (#{rec['id']})</b>
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"📌 <b>الاتجاه والعقد:</b> <code>{rec['side']} ({rec['lots']} Lot)</code>
+"
+            f"📥 <b>سعر الدخول:</b> <code>${rec['entry_price']:.2f}</code>
+"
+            f"📤 <b>سعر الخروج:</b> <code>${rec['exit_price']:.2f}</code>
+"
+            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_str})</code>
+"
+            f"📝 <b>سبب الخروج:</b> {rec['reason_exit']}
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"🏦 <b>الرصيد المحدث:</b> <code>${balance:,.2f}</code>
+"
+            f"📈 <b>نسبة النجاح الكلية:</b> <code>{kpis['win_rate']}% ({kpis['wins']}W/{kpis['losses']}L)</code>
+"
+            f"🕒 <b>وقت الإغلاق:</b> <code>{rec['closed_at']} UTC</code>"
+        )
+        await self.send_html(msg)
+
+    async def send_daily_report(self, report: Dict, force: bool = False) -> bool:
+        if not force and not self.is_configured():
+            return False
+        net = report["daily_pnl"]
+        net_icon = "🟢" if net >= 0 else "🔴"
+        net_str = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
+        weights_txt = " | ".join([f"{k.split('_')[0]}: {v}x" for k, v in report["weights"].items()])
+
+        msg = (
+            f"📊 <b>التقرير اليومي لإغلاق سوق الذهب | XAU/USD</b>
+"
+            f"📅 <b>التاريخ:</b> <code>{report['date']}</code>
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"🔢 <b>صفقات اليوم:</b> <code>{report['daily_total']}</code> "
+            f"(رابحة: <code>{report['daily_wins']}</code> | خاسرة: <code>{report['daily_losses']}</code>)
+"
+            f"🎯 <b>نسبة نجاح اليوم:</b> <code>{report['daily_win_rate']}%</code>
+"
+            f"{net_icon} <b>صافي ربح/خسارة اليوم:</b> <code>{net_str} ({report['daily_return_pct']:+.2f}%)</code>
+"
+            f"🏆 <b>أفضل صفقة اليوم:</b> <code>+${report['best_trade']:.2f}</code>
+"
+            f"⚠️ <b>أسوأ صفقة اليوم:</b> <code>${report['worst_trade']:.2f}</code>
+"
+            f"━━━━━━━━━━━━━━━━━━
+"
+            f"🏦 <b>إجمالي الرصيد الحالي:</b> <code>${report['balance']:,.2f}</code>
+"
+            f"📈 <b>إجمالي الصافي الكلي:</b> <code>${report['total_net_pnl']:+,.2f}</code>
+"
+            f"🛡️ <b>أقصى سحب مسجل (Max DD):</b> <code>{report['max_dd_pct']:.2f}%</code>
+"
+            f"⚖️ <b>أوزان التعلم الذاتي:</b>
+<code>{weights_txt}</code>"
+        )
+        return await self.send_html(msg, force=force)
+
+
+# ==============================================================================
+# 3. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex)
 # ==============================================================================
 class AutonomousQuantitativeBrain:
     POLICIES = (
@@ -121,11 +318,12 @@ class AutonomousQuantitativeBrain:
         "VOLATILITY_EXPANSION",
     )
 
-    def __init__(self):
+    def __init__(self, tg: TelegramNotifier):
         self.lock = asyncio.Lock()
+        self.tg = tg
         self.bot_active: bool = True
         self.can_trade: bool = False
-        self.lot_mode: str = "FIXED_001"  # FIXED_001 (0.01 ثابت) | DYNAMIC_RISK (نسبة مخاطرة ديناميكية)
+        self.lot_mode: str = "FIXED_001"  # FIXED_001 (0.01 ثابت) | DYNAMIC_RISK
         self.balance: float = 10000.0
         self.equity: float = 10000.0
         self.initial_balance: float = 10000.0
@@ -192,7 +390,7 @@ class AutonomousQuantitativeBrain:
             print("Runtime save error:", repr(e))
 
     def _restore_state(self):
-        """استرجاع الرصيد، الأوزان، الإحصائيات، والصفقة المفتوحة من SQLite بعد إعادة التشغيل."""
+        """استرجاع الرصيد، الأوزان، الإحصائيات، الصفقة المفتوحة، وإعدادات التلغرام من SQLite."""
         try:
             conn = sqlite3.connect(DB_PATH)
             try:
@@ -234,19 +432,27 @@ class AutonomousQuantitativeBrain:
                         if k in saved:
                             self.policy_weights[k] = float(np.clip(float(saved[k]), 0.5, 1.8))
 
-                # استرجاع الصفقة المفتوحة ووضع اللوت وفترة التهدئة
                 c.execute("SELECT key, value FROM runtime_state")
                 for k, v in c.fetchall():
-                    if k == "open_position" and v:
-                        pos = json.loads(v)
-                        if isinstance(pos, dict) and "side" in pos:
-                            self.open_position = pos
-                    elif k == "lot_mode" and v:
-                        mode = json.loads(v)
-                        if mode in ("FIXED_001", "DYNAMIC_RISK"):
-                            self.lot_mode = mode
-                    elif k == "cooldown_until" and v:
-                        self.cooldown_until = float(json.loads(v))
+                    if not v:
+                        continue
+                    parsed = json.loads(v)
+                    if k == "open_position" and isinstance(parsed, dict) and "side" in parsed:
+                        self.open_position = parsed
+                    elif k == "lot_mode" and parsed in ("FIXED_001", "DYNAMIC_RISK"):
+                        self.lot_mode = parsed
+                    elif k == "cooldown_until":
+                        self.cooldown_until = float(parsed)
+                    elif k == "telegram_config" and isinstance(parsed, dict):
+                        if parsed.get("bot_token"):
+                            self.tg.bot_token = str(parsed["bot_token"]).strip()
+                        if parsed.get("chat_id"):
+                            self.tg.chat_id = str(parsed["chat_id"]).strip()
+                        if "enabled" in parsed:
+                            self.tg.enabled = bool(parsed["enabled"])
+                        self.tg.last_status = "مُحمّل من الذاكرة الدائمة" if self.tg.is_configured() else "غير مُفعّل"
+                    elif k == "last_report_date":
+                        self.tg.last_report_date = str(parsed)
             finally:
                 conn.close()
         except Exception as e:
@@ -260,6 +466,61 @@ class AutonomousQuantitativeBrain:
                 break
         self.consec_losses = streak
 
+    def update_telegram_config(self, bot_token: str, chat_id: str, enabled: bool):
+        if bot_token.strip() and "..." not in bot_token:
+            self.tg.bot_token = bot_token.strip()
+        self.tg.chat_id = chat_id.strip()
+        self.tg.enabled = bool(enabled and self.tg.bot_token and self.tg.chat_id)
+        self._save_runtime_key("telegram_config", {
+            "bot_token": self.tg.bot_token,
+            "chat_id": self.tg.chat_id,
+            "enabled": self.tg.enabled,
+        })
+        self.tg.last_status = "تم حفظ الإعدادات" if self.tg.is_configured() else "تم الإيقاف أو بيانات ناقصة"
+
+    def build_daily_report_data(self, date_str: Optional[str] = None) -> Dict:
+        target_date = date_str or today_utc_str()
+        month_day_prefix = target_date[5:]  # MM-DD للتوافق مع السجلات السابقة
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT pnl FROM trade_history
+                WHERE trade_date = ? OR (trade_date IS NULL AND closed_at LIKE ?)
+                """,
+                (target_date, f"{month_day_prefix}%"),
+            )
+            rows = [float(r[0]) for r in c.fetchall()]
+        finally:
+            conn.close()
+
+        total = len(rows)
+        wins = sum(1 for x in rows if x > 0)
+        losses = sum(1 for x in rows if x < 0)
+        daily_pnl = round(sum(rows), 2)
+        win_rate = round((wins / total) * 100.0, 1) if total else 0.0
+        start_day_bal = max(100.0, self.balance - daily_pnl)
+        daily_return_pct = round((daily_pnl / start_day_bal) * 100.0, 2)
+        best_trade = round(max(rows), 2) if rows else 0.0
+        worst_trade = round(min(rows), 2) if rows else 0.0
+
+        return {
+            "date": target_date,
+            "daily_total": total,
+            "daily_wins": wins,
+            "daily_losses": losses,
+            "daily_win_rate": win_rate,
+            "daily_pnl": daily_pnl,
+            "daily_return_pct": daily_return_pct,
+            "best_trade": best_trade,
+            "worst_trade": worst_trade,
+            "balance": self.balance,
+            "total_net_pnl": round(self.balance - self.initial_balance, 2),
+            "max_dd_pct": self.max_drawdown_pct,
+            "weights": dict(self.policy_weights),
+        }
+
     def log_thought(self, msg: str, category: str = "COGNITION"):
         self.thoughts.appendleft({
             "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -269,7 +530,7 @@ class AutonomousQuantitativeBrain:
 
     # --------------------------------------------------------------- الإحصاء والرياضيات الكمية
     def compute_hurst_exponent(self, prices: np.ndarray) -> float:
-        """حساب معامل هيرست المصحح باستخدام الفروق اللوغاريتمية المُزال منها الانجراف (Detrended Log-Returns)."""
+        """حساب معامل هيرست المصحح باستخدام الفروق اللوغاريتمية المُزال منها الانجراف."""
         if len(prices) < 45:
             return 0.5
         log_p = np.log(np.maximum(prices, 1e-4))
@@ -277,7 +538,6 @@ class AutonomousQuantitativeBrain:
         tau, valid_lags = [], []
         for lag in lags:
             diff = log_p[lag:] - log_p[:-lag]
-            # إزالة الانجراف المتوسط لمنع انحياز الشمعة الواحدة
             diff_detrended = diff - np.mean(diff)
             std_val = float(np.std(diff_detrended))
             if std_val > 1e-8:
@@ -297,14 +557,13 @@ class AutonomousQuantitativeBrain:
             return 0.30
         num_bins = 10
         counts, _ = np.histogram(returns, bins=num_bins, density=False)
-        # تنعيم لابلاس الطفيف لمنع القفزات الحادة عند الفئات الفارغة
         smoothed = counts.astype(float) + 0.05
         probs = smoothed / np.sum(smoothed)
         entropy = -np.sum(probs * np.log2(probs)) / np.log2(num_bins)
         return round(float(np.clip(entropy, 0.05, 0.99)), 3)
 
     def compute_true_atr(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-        """حساب متوسط المدى الحقيقي (Wilder's True Range ATR) شاملة الفجوات السعرية."""
+        """حساب متوسط المدى الحقيقي (Wilder's True Range ATR)."""
         if len(closes) < 2:
             return 1.2
         prev_closes = closes[:-1]
@@ -344,7 +603,6 @@ class AutonomousQuantitativeBrain:
             dist = np.abs(closes - level)
             kernel = np.exp(-0.5 * (dist / bandwidth) ** 2)
             densities[i] = np.sum(kernel)
-            # بروفيل الحجم المرجح بتواجد السعر ونشاط الشمعة
             in_candle = (lows <= level + bandwidth * 0.5) & (highs >= level - bandwidth * 0.5)
             if np.any(in_candle):
                 vol_profile[i] = float(np.sum(ranges[in_candle]))
@@ -352,7 +610,6 @@ class AutonomousQuantitativeBrain:
             if np.any(near_mask):
                 rejection_energy[i] = float(np.mean(wicks[near_mask]))
 
-        # استخراج POC و VAH و VAL (منطقة القيمة 70%)
         poc_idx = int(np.argmax(vol_profile))
         self.poc_price = round(float(grid[poc_idx]), 2)
         total_vp = float(np.sum(vol_profile)) + 1e-9
@@ -402,26 +659,21 @@ class AutonomousQuantitativeBrain:
         if len(closes) < 25:
             return result
 
-        # آخر شمعة مغلقة
         o1, h1, l1, c1 = opens[-1], highs[-1], lows[-1], closes[-1]
         rng1 = max(h1 - l1, 1e-4)
         lower_wick = min(o1, c1) - l1
         upper_wick = h1 - max(o1, c1)
 
-        # القاع والقمة المحلية للشموع الـ 15 السابقة لها
         prev_low = float(np.min(lows[-16:-1]))
         prev_high = float(np.max(highs[-16:-1]))
 
-        # Liquidity Sweep صاعد: كسر القاع المحلي بذيل سفلي يمثل أكثر من 40% من الشمعة والإغلاق فوق القاع
         if l1 < prev_low and c1 > prev_low and (lower_wick / rng1) >= 0.40:
             result["bull_sweep"] = True
             result["label"] = "BULL_LIQUIDITY_SWEEP"
-        # Liquidity Sweep هابط: كسر القمة المحلية بذيل علوي يمثل أكثر من 40% من الشمعة والإغلاق تحت القمة
         elif h1 > prev_high and c1 < prev_high and (upper_wick / rng1) >= 0.40:
             result["bear_sweep"] = True
             result["label"] = "BEAR_LIQUIDITY_SWEEP"
 
-        # Fair Value Gap (FVG) على آخر 3 شموع مغلقة
         if lows[-1] > highs[-3] and (closes[-2] - opens[-2]) > self.atr_value * 0.55:
             result["bull_fvg"] = True
             if result["label"] == "NONE":
@@ -475,7 +727,6 @@ class AutonomousQuantitativeBrain:
 
         def weighted(policy: str, s: float) -> float:
             w = self.policy_weights[policy]
-            # تعزيز وزن السياسة المتوافقة مع الجلسة النشطة
             if session_info["bias"] == "MOMENTUM" and policy in ("MOMENTUM_CONTINUATION", "VOLATILITY_EXPANSION"):
                 w *= 1.08
             elif session_info["bias"] == "REVERSION" and policy == "GRAVITY_MEAN_REVERSION":
@@ -523,13 +774,11 @@ class AutonomousQuantitativeBrain:
                 direction = -1
             if direction != 0:
                 conviction = 74.0 + min(20.0, abs(short_drift) * 13.5 + max(0.0, raw_edge * 2.4))
-                # تأكيد FVG يعزز قناعة الزخم
                 if (direction == 1 and smc["bull_fvg"]) or (direction == -1 and smc["bear_fvg"]):
                     conviction += 5.5
             else:
                 conviction = 56.0 + min(15.0, abs(short_drift) * 10.0)
         else:
-            # الارتداد للمتوسط مع دعم سحب السيولة (SMC Sweep)
             if (z_score < -1.20 and short_drift > -0.18) or smc["bull_sweep"]:
                 direction = 1
             elif (z_score > 1.20 and short_drift < 0.18) or smc["bear_sweep"]:
@@ -546,7 +795,6 @@ class AutonomousQuantitativeBrain:
             conviction = min(conviction, 70.0)
             reason = "السياسة بلا ميزة إحصائية حديثة أو هيكل SMC"
 
-        # تقييم موقع السعر بالنسبة لمناطق الشذوذ والـ POC
         if self.discovered_zones and direction != 0:
             cur_p = self.last_price if self.last_price is not None else float(closes[-1])
             nearest = min(self.discovered_zones, key=lambda z: abs(z["price"] - cur_p))
@@ -580,7 +828,6 @@ class AutonomousQuantitativeBrain:
         return float(np.mean(arr <= x)) if len(arr) else 0.5
 
     def _warm_history(self, closes: np.ndarray):
-        """تصفير وتعبئة سجل هيرست/الإنتروبيا بنظافة من التاريخ المدمج."""
         self.hist_hurst.clear()
         self.hist_entropy.clear()
         start = max(91, len(closes) - 300)
@@ -589,7 +836,6 @@ class AutonomousQuantitativeBrain:
             self.hist_entropy.append(self.compute_shannon_entropy(np.diff(closes[max(0, j - 61):j])))
 
     def _analyze(self, closed: List[Dict]):
-        """تحليل كمّي وهيكلي على الشموع المغلقة فقط — يُنفَّذ مرة واحدة عند إغلاق كل شمعة."""
         opens = np.array([c["open"] for c in closed], dtype=float)
         closes = np.array([c["close"] for c in closed], dtype=float)
         highs = np.array([c["high"] for c in closed], dtype=float)
@@ -616,7 +862,6 @@ class AutonomousQuantitativeBrain:
 
         d = self._decision
         if d["direction"] != 0 and d["score"] >= ENTRY_CONFIDENCE:
-            # إذا وُجد حدث SMC صريح (Liquidity Sweep أو FVG) مع قناعة >= 87%، يكفي تأكيد شمعة واحدة
             req_confirm = 1 if (d.get("smc_event", "NONE") != "NONE" and d["score"] >= 87.0) else SIGNAL_CONFIRM
             self._streak = self._streak + 1 if d["direction"] == self._last_dir else 1
             self._last_dir = d["direction"]
@@ -627,8 +872,25 @@ class AutonomousQuantitativeBrain:
             self._streak, self._last_dir = 0, 0
             d["confirmed"] = False
 
+    async def check_and_send_daily_rollover_report(self):
+        """فحص موعد إغلاق السوق اليومي (21:01 UTC) وإرسال التقرير اليومي التلقائي عبر تلغرام مرة واحدة يومياً."""
+        if not self.tg.is_configured():
+            return
+        now_utc = datetime.now(timezone.utc)
+        today_str = now_utc.strftime("%Y-%m-%d")
+        # إغلاق سوق الذهب اليومي يبدأ الساعة 21:00 UTC
+        if now_utc.hour == 21 and now_utc.minute >= 1 and self.tg.last_report_date != today_str:
+            self.tg.last_report_date = today_str
+            self._save_runtime_key("last_report_date", today_str)
+            report = self.build_daily_report_data(today_str)
+            sent = await self.tg.send_daily_report(report)
+            if sent:
+                self.log_thought(f"تم إرسال التقرير اليومي لإغلاق السوق ({today_str}) إلى تلغرام.", "SYSTEM")
+
     async def process_market_state(self):
         async with self.lock:
+            await self.check_and_send_daily_rollover_report()
+
             if len(self.candles) < MIN_CANDLES or self.last_price is None:
                 self.block_reason = f"تجميع البيانات ({len(self.candles)}/{MIN_CANDLES} شمعة)"
                 return
@@ -642,7 +904,7 @@ class AutonomousQuantitativeBrain:
 
             if self.open_position is not None:
                 self.block_reason = "صفقة مفتوحة قيد الإدارة"
-                self._manage_open_position(decision)
+                await self._manage_open_position(decision)
                 return
 
             self.equity = self.balance
@@ -661,7 +923,7 @@ class AutonomousQuantitativeBrain:
                 return
             if decision["direction"] != 0 and decision["score"] >= ENTRY_CONFIDENCE and decision.get("confirmed"):
                 self.block_reason = "إشارة مؤكدة — جاري التنفيذ"
-                self._open_position(decision)
+                await self._open_position(decision)
             else:
                 self.block_reason = decision.get("reason", "لا إعداد")
 
@@ -671,7 +933,6 @@ class AutonomousQuantitativeBrain:
         return round(p, 2)
 
     def _compute_structural_stops(self, side: str, entry: float) -> tuple[float, float, float]:
-        """حساب الوقف والهدف بناءً على هيكل الشموع والمناطق المكتشفة و ATR الحقيقي."""
         closed = list(self.candles)[:-1]
         recent = closed[-12:] if len(closed) >= 12 else closed
         atr = max(0.6, self.atr_value)
@@ -681,7 +942,6 @@ class AutonomousQuantitativeBrain:
             raw_sl = min(entry - atr * 1.6, swing_low - atr * 0.35)
             sl_d = float(np.clip(entry - raw_sl, atr * 1.4, atr * 3.2))
             tp_d = round(sl_d * 1.75, 2)
-            # إذا كانت هناك منطقة جاذبية/مقاومة قوية أمام الهدف قريباً، نضع الهدف قبلها بقليل
             above_zones = [z["price"] for z in self.discovered_zones if z["price"] > entry + sl_d * 1.1]
             if above_zones:
                 nearest_res = min(above_zones)
@@ -702,7 +962,7 @@ class AutonomousQuantitativeBrain:
             sl_d = round(sl_d, 2)
             return round(entry + sl_d, 2), round(entry - tp_d, 2), sl_d
 
-    def _open_position(self, decision: Dict):
+    async def _open_position(self, decision: Dict):
         if self.balance <= 0 or self.last_price is None:
             return
         side = "BUY" if decision["direction"] == 1 else "SELL"
@@ -754,8 +1014,9 @@ class AutonomousQuantitativeBrain:
         }
         self._save_runtime_key("open_position", self.open_position)
         self.log_thought(f"دخول [{side}] عند {entry:.2f}$ بحجم {lots}L (SL={sl_price}$, TP={tp_price}$) — {reason}", "EXECUTION")
+        await self.tg.notify_entry(self.open_position, get_active_session()["label"])
 
-    def _manage_open_position(self, decision: Dict):
+    async def _manage_open_position(self, decision: Dict):
         pos = self.open_position
         if not pos or self.last_price is None:
             return
@@ -773,7 +1034,6 @@ class AutonomousQuantitativeBrain:
         pos["r_multiple"] = round(r_multiple, 2)
         held = time.time() - pos["opened_ts"]
 
-        # فصل منطق التأمين: للوت >= 0.02 جني جزئي عند 0.85R، وللوت 0.01 تأمين Break-Even عند 1.15R لتفادي الذيول الكاذبة
         can_partial = pos["lots"] >= 0.02
         be_trigger_r = 0.85 if can_partial else 1.15
 
@@ -782,6 +1042,7 @@ class AutonomousQuantitativeBrain:
             pos["sl"] = round(pos["entry_price"] + lock if side == "BUY" else pos["entry_price"] - lock, 2)
             pos["be_secured"] = True
 
+            note_msg = f"تأمين Break-Even+ عند {r_multiple:.2f}R ونقل الوقف إلى {pos['sl']:.2f}$"
             if not pos["partial_taken"] and can_partial:
                 closed_lots = round(max(0.01, round(pos["lots"] * 0.5, 2)), 2)
                 if pos["lots"] - closed_lots >= 0.01:
@@ -790,18 +1051,12 @@ class AutonomousQuantitativeBrain:
                     pos["realized"] = round(pos["realized"] + chunk, 2)
                     pos["lots"] = round(pos["lots"] - closed_lots, 2)
                     pos["partial_taken"] = True
-                    self.log_thought(
-                        f"تأمين ذكي: جني جزئي ({closed_lots}L) بربح {chunk:+.2f}$ ونقل الوقف لـ {pos['sl']:.2f}$",
-                        "RISK_SHIELD",
-                    )
-            else:
-                self.log_thought(
-                    f"تأمين Break-Even+ عند {r_multiple:.2f}R: نقل الوقف إلى {pos['sl']:.2f}$",
-                    "RISK_SHIELD",
-                )
-            self._save_runtime_key("open_position", pos)
+                    note_msg = f"جني جزئي ({closed_lots}L) بربح {chunk:+.2f}$ ونقل الوقف لـ {pos['sl']:.2f}$"
 
-        # وقف تتبعي محمي بحد أدنى مرتبط بالمخاطرة الأولية و ATR الحقيقي
+            self.log_thought(f"تأمين ذكي: {note_msg}", "RISK_SHIELD")
+            self._save_runtime_key("open_position", pos)
+            await self.tg.notify_secured(pos, note_msg)
+
         if pos["be_secured"] and r_multiple >= 1.40:
             trail_dist = round(max(pos["initial_risk"] * 0.55, self.atr_value * 1.15), 2)
             if side == "BUY":
@@ -818,22 +1073,22 @@ class AutonomousQuantitativeBrain:
         hit_tp = q >= pos["tp"] if side == "BUY" else q <= pos["tp"]
         hit_sl = q <= pos["sl"] if side == "BUY" else q >= pos["sl"]
         if hit_tp:
-            self._close_position(q, "ضرب الهدف الإحصائي الهيكلي (Structural TP Hit)")
+            await self._close_position(q, "ضرب الهدف الإحصائي الهيكلي (Structural TP Hit)")
             return
         if hit_sl:
             reason = "وقف الأرباح المتحرك (Secured Trailing SL)" if pos["be_secured"] else "ضرب وقف الحماية الهيكلي (Structural SL)"
-            self._close_position(q, reason)
+            await self._close_position(q, reason)
             return
 
         opposite = (side == "BUY" and decision["direction"] == -1) or (side == "SELL" and decision["direction"] == 1)
         if opposite and decision["score"] >= 82.0 and held >= OPPOSITE_EXIT_MIN_HOLD_S:
-            self._close_position(q, f"خروج استباقي: انعكاس هيكلي مضاد بقوة {decision['score']}%")
+            await self._close_position(q, f"خروج استباقي: انعكاس هيكلي مضاد بقوة {decision['score']}%")
             return
 
         if held > STAGNATION_EXIT_S and abs(r_multiple) < 0.25 and self.entropy > 0.84:
-            self._close_position(q, f"إلغاء الفرضية ذاتياً: تباطؤ الزخم وارتفاع الإنتروبيا لـ {self.entropy}")
+            await self._close_position(q, f"إلغاء الفرضية ذاتياً: تباطؤ الزخم وارتفاع الإنتروبيا لـ {self.entropy}")
 
-    def _close_position(self, exit_price: float, reason_exit: str):
+    async def _close_position(self, exit_price: float, reason_exit: str):
         pos = self.open_position
         if not pos:
             return
@@ -852,6 +1107,9 @@ class AutonomousQuantitativeBrain:
         if dd_pct > self.max_drawdown_pct:
             self.max_drawdown_pct = dd_pct
 
+        r_result = round(total_pnl / max(pos["risk_usd"], 1e-6), 2)
+        trade_date = today_utc_str()
+
         record = {
             "id": pos["id"],
             "side": pos["side"],
@@ -865,6 +1123,7 @@ class AutonomousQuantitativeBrain:
             "reason_exit": reason_exit,
             "opened_at": pos["opened_at"],
             "closed_at": stamp(),
+            "trade_date": trade_date,
         }
         self.trade_log.insert(0, record)
         del self.trade_log[50:]
@@ -879,7 +1138,6 @@ class AutonomousQuantitativeBrain:
 
         pol = pos["policy"]
         if pol in self.policy_weights:
-            r_result = total_pnl / max(pos["risk_usd"], 1e-6)
             delta = float(np.clip(r_result, -1.0, 1.5)) * 0.05
             self.policy_weights[pol] = round(float(np.clip(self.policy_weights[pol] + delta, 0.5, 1.8)), 3)
 
@@ -905,9 +1163,10 @@ class AutonomousQuantitativeBrain:
             print("Persist error:", repr(e))
 
         self.log_thought(
-            f"إغلاق [{pos['side']}] عند {exit_price:.2f}$ | الصافي: {total_pnl:+.2f}$ | السبب: {reason_exit}",
+            f"إغلاق [{pos['side']}] عند {exit_price:.2f}$ | الصافي: {total_pnl:+.2f}$ ({r_result:+.2f}R) | السبب: {reason_exit}",
             "EXIT_DECISION",
         )
+        await self.tg.notify_exit(record, r_result, self.balance, self.get_kpi_metrics())
 
     def _persist_trade_and_lesson(self, rec: Dict, policy_name: str):
         conn = sqlite3.connect(DB_PATH)
@@ -916,13 +1175,13 @@ class AutonomousQuantitativeBrain:
             c.execute(
                 """
                 INSERT INTO trade_history (side, entry_price, exit_price, lots, pnl, confidence, regime,
-                                           reason_entry, reason_exit, opened_at, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                           reason_entry, reason_exit, opened_at, closed_at, trade_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec["side"], rec["entry_price"], rec["exit_price"], rec["lots"], rec["pnl"],
                     rec["confidence"], rec["regime"], rec["reason_entry"], rec["reason_exit"],
-                    rec["opened_at"], rec["closed_at"],
+                    rec["opened_at"], rec["closed_at"], rec.get("trade_date", today_utc_str()),
                 ),
             )
             c.execute(
@@ -962,11 +1221,12 @@ class AutonomousQuantitativeBrain:
         }
 
 
-brain = AutonomousQuantitativeBrain()
+tg_notifier = TelegramNotifier()
+brain = AutonomousQuantitativeBrain(tg_notifier)
 
 
 # ==============================================================================
-# 3. محرك بث سعر CFD الذهب الفوري XAU/USD
+# 4. محرك بث سعر CFD الذهب الفوري XAU/USD
 # ==============================================================================
 def parse_swissquote(data, profile: str):
     items = data if isinstance(data, list) else [data]
@@ -1088,7 +1348,6 @@ class LiveGoldStream:
             ]
             self.brain.candles.clear()
             self.brain.candles.extend(shifted + live)
-            # تصفير وإعادة بناء السجل التاريخي لهيرست والإنتروبيا بعد الدمج
             closes_arr = np.array([c["close"] for c in self.brain.candles], dtype=float)
             self.brain._warm_history(closes_arr)
             self.brain._analysis_ts = None
@@ -1123,6 +1382,7 @@ class LiveGoldStream:
         finally:
             if self._client is not None:
                 await self._client.aclose()
+            await self.brain.tg.aclose()
 
     async def _step(self):
         b = self.brain
@@ -1188,6 +1448,14 @@ class LiveGoldStream:
             "balance": b.balance,
             "equity": b.equity,
             "kpis": b.get_kpi_metrics(),
+            "telegram": {
+                "enabled": b.tg.enabled,
+                "configured": b.tg.is_configured(),
+                "masked_token": b.tg.masked_token(),
+                "chat_id": b.tg.chat_id,
+                "last_status": b.tg.last_status,
+                "last_report_date": b.tg.last_report_date,
+            },
             "cognition": {
                 "hurst": b.hurst,
                 "hurst_rank": round(b.hurst_rank * 100, 1),
@@ -1255,11 +1523,11 @@ async def lifespan(_: FastAPI):
             pass
 
 
-app = FastAPI(title="Autonomous XAU/USD Quantitative React Terminal", lifespan=lifespan)
+app = FastAPI(title="Autonomous XAU/USD Quantitative React Terminal v3", lifespan=lifespan)
 
 
 # ==============================================================================
-# 4. خادم ومتحكم WebSockets
+# 5. خادم ومتحكم WebSockets
 # ==============================================================================
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -1279,16 +1547,54 @@ async def websocket_endpoint(ws: WebSocket):
                     brain.bot_active = not brain.bot_active
                     state_txt = "مُفعّل ومستقل" if brain.bot_active else "مُتوقف مؤقتاً"
                     brain.log_thought(f"تم تغيير حالة الوكيل يدوياً إلى: {state_txt}", "SYSTEM")
+
                 elif cmd == "TOGGLE_LOT_MODE":
                     brain.lot_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED_001" else "FIXED_001"
                     brain._save_runtime_key("lot_mode", brain.lot_mode)
                     mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة ديناميكية %"
                     brain.log_thought(f"تم تبديل نظام حجم العقد إلى: {mode_lbl}", "SYSTEM")
+
                 elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
-                    brain._close_position(
+                    await brain._close_position(
                         brain._exit_quote(brain.open_position["side"]),
                         "إغلاق فوري بطلب المالك (Manual Emergency Exit)",
                     )
+
+                elif cmd == "SAVE_TELEGRAM":
+                    token = str(data.get("bot_token", "")).strip()
+                    chat_id = str(data.get("chat_id", "")).strip()
+                    enabled = bool(data.get("enabled", True))
+                    brain.update_telegram_config(token, chat_id, enabled)
+                    brain.log_thought(f"تم تحديث إعدادات إشعارات تلغرام ({brain.tg.last_status}).", "SYSTEM")
+
+                elif cmd == "TEST_TELEGRAM":
+                    test_msg = (
+                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Quant Cortex</b>
+"
+                        "━━━━━━━━━━━━━━━━━━
+"
+                        f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.
+"
+                        f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>
+"
+                        f"📊 <b>سعر الذهب الحي:</b> <code>${brain.last_price or 0.0:.2f}</code>
+"
+                        f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
+                    )
+                    ok = await brain.tg.send_html(test_msg, force=True)
+                    brain.log_thought(
+                        "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
+                        "SYSTEM",
+                    )
+
+                elif cmd == "SEND_DAILY_REPORT_NOW":
+                    report = brain.build_daily_report_data()
+                    ok = await brain.tg.send_daily_report(report, force=True)
+                    brain.log_thought(
+                        "تم إرسال التقرير اليومي إلى تلغرام يدوياً." if ok else f"تعذر إرسال التقرير اليومي: {brain.tg.last_status}",
+                        "SYSTEM",
+                    )
+
             await stream_manager.broadcast_state()
     except WebSocketDisconnect:
         pass
@@ -1300,13 +1606,13 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ==============================================================================
-# 5. واجهة React 18 الاحترافية (Apple Pro Dark Quantitative Workstation)
+# 6. واجهة React 18 المتجاوبة بالكامل للهاتف وسطح المكتب (Mobile-First + Apple Dark UI)
 # ==============================================================================
 HTML_UI = """<!DOCTYPE html>
 <html lang="ar" dir="rtl" class="dark">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>XAU/USD — Quantitative Cortex React Terminal</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
@@ -1317,14 +1623,14 @@ HTML_UI = """<!DOCTYPE html>
   <style>
     :root {
       --bg-canvas: #06080D;
-      --bg-card: rgba(13, 17, 26, 0.85);
-      --border-glass: rgba(255, 255, 255, 0.07);
+      --bg-card: rgba(13, 17, 26, 0.88);
+      --border-glass: rgba(255, 255, 255, 0.08);
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body {
       background-color: var(--bg-canvas);
       background-image:
-        radial-gradient(at 15% 0%, rgba(245, 158, 11, 0.06) 0px, transparent 45%),
+        radial-gradient(at 15% 0%, rgba(245, 158, 11, 0.07) 0px, transparent 45%),
         radial-gradient(at 85% 5%, rgba(16, 185, 129, 0.05) 0px, transparent 45%);
       color: #F1F5F9;
       font-family: 'Cairo', sans-serif;
@@ -1343,13 +1649,15 @@ HTML_UI = """<!DOCTYPE html>
       -webkit-backdrop-filter: blur(20px);
       border: 1px solid var(--border-glass);
       border-radius: 16px;
-      box-shadow: 0 12px 36px -8px rgba(0, 0, 0, 0.55);
+      box-shadow: 0 12px 34px -8px rgba(0, 0, 0, 0.55);
     }
     .glass-pill {
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.07);
-      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid rgba(255, 255, 255, 0.075);
+      border-radius: 11px;
     }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     @keyframes pulseGlow {
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.45; transform: scale(0.92); }
@@ -1357,8 +1665,7 @@ HTML_UI = """<!DOCTYPE html>
     .dot-live { animation: pulseGlow 2s infinite ease-in-out; }
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.2); border-radius: 9999px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.35); }
+    ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.22); border-radius: 9999px; }
   </style>
 </head>
 <body>
@@ -1367,7 +1674,6 @@ HTML_UI = """<!DOCTYPE html>
   <script type="text/babel">
     const { useState, useEffect, useRef, useMemo } = React;
 
-    // شارة فئة التفكير
     const categoryBadge = (cat) => {
       const map = {
         EXECUTION: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
@@ -1379,7 +1685,7 @@ HTML_UI = """<!DOCTYPE html>
       return map[cat] || "bg-slate-700/40 text-slate-300 border-slate-600/40";
     };
 
-    // مكون شارت TradingView Lightweight المدمج مع React
+    // مكون شارت TradingView المتجاوب مع الهاتف وسطح المكتب
     function TradingChart({ candles, latestCandle, zones, openPos, poc, vah, val, showZones, showVP }) {
       const containerRef = useRef(null);
       const chartRef = useRef(null);
@@ -1415,6 +1721,8 @@ HTML_UI = """<!DOCTYPE html>
             timeVisible: true,
             secondsVisible: false,
           },
+          handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+          handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
         });
 
         const series = chart.addCandlestickSeries({
@@ -1432,7 +1740,9 @@ HTML_UI = """<!DOCTYPE html>
         const ro = new ResizeObserver(entries => {
           if (!entries.length) return;
           const { width, height } = entries[0].contentRect;
-          chart.applyOptions({ width, height });
+          if (width > 0 && height > 0) {
+            chart.applyOptions({ width, height });
+          }
         });
         ro.observe(containerRef.current);
 
@@ -1442,7 +1752,6 @@ HTML_UI = """<!DOCTYPE html>
         };
       }, []);
 
-      // تحميل الشموع الأولية
       useEffect(() => {
         if (seriesRef.current && candles && candles.length > 0) {
           seriesRef.current.setData(candles);
@@ -1450,14 +1759,12 @@ HTML_UI = """<!DOCTYPE html>
         }
       }, [candles]);
 
-      // تحديث الشمعة الحية
       useEffect(() => {
         if (seriesRef.current && latestCandle) {
           seriesRef.current.update(latestCandle);
         }
       }, [latestCandle]);
 
-      // رسم مناطق الجاذبية والشذوذ
       useEffect(() => {
         if (!seriesRef.current) return;
         zoneLinesRef.current.forEach(l => seriesRef.current.removePriceLine(l));
@@ -1472,13 +1779,12 @@ HTML_UI = """<!DOCTYPE html>
             lineWidth: 1,
             lineStyle: LightweightCharts.LineStyle.Dashed,
             axisLabelVisible: true,
-            title: `${isRepulsor ? 'شذوذ رفض' : 'جاذبية'} ${z.strength}%`,
+            title: `${isRepulsor ? 'رفض' : 'جاذبية'} ${z.strength}%`,
           });
           zoneLinesRef.current.push(line);
         });
       }, [zones, showZones]);
 
-      // رسم خطوط Volume Profile (POC / VAH / VAL)
       useEffect(() => {
         if (!seriesRef.current) return;
         vpLinesRef.current.forEach(l => seriesRef.current.removePriceLine(l));
@@ -1492,7 +1798,7 @@ HTML_UI = """<!DOCTYPE html>
             lineWidth: 2,
             lineStyle: LightweightCharts.LineStyle.Solid,
             axisLabelVisible: true,
-            title: 'VP POC',
+            title: 'POC',
           }));
         }
         if (vah) {
@@ -1517,7 +1823,6 @@ HTML_UI = """<!DOCTYPE html>
         }
       }, [poc, vah, val, showVP]);
 
-      // رسم خطوط الصفقة المفتوحة
       useEffect(() => {
         if (!seriesRef.current) return;
         posLinesRef.current.forEach(l => seriesRef.current.removePriceLine(l));
@@ -1538,7 +1843,7 @@ HTML_UI = """<!DOCTYPE html>
           lineWidth: 2,
           lineStyle: LightweightCharts.LineStyle.Dotted,
           axisLabelVisible: true,
-          title: 'STRUCTURAL TP',
+          title: 'TP',
         }));
         posLinesRef.current.push(seriesRef.current.createPriceLine({
           price: openPos.sl,
@@ -1546,14 +1851,13 @@ HTML_UI = """<!DOCTYPE html>
           lineWidth: 2,
           lineStyle: LightweightCharts.LineStyle.Dotted,
           axisLabelVisible: true,
-          title: openPos.be_secured ? 'SECURED SL (BE+)' : 'STRUCTURAL SL',
+          title: openPos.be_secured ? 'SL (BE+)' : 'SL',
         }));
       }, [openPos]);
 
-      return <div ref={containerRef} className="w-full h-full min-h-[410px]" />;
+      return <div ref={containerRef} className="w-full h-[270px] sm:h-[360px] lg:h-[430px]" />;
     }
 
-    // التطبيق الرئيسي
     function App() {
       const [connected, setConnected] = useState(false);
       const [snapshotCandles, setSnapshotCandles] = useState([]);
@@ -1572,6 +1876,7 @@ HTML_UI = """<!DOCTYPE html>
         balance: 10000,
         equity: 10000,
         kpis: { win_rate: 0, total_trades: 0, wins: 0, losses: 0, profit_factor: 0, net_pnl: 0, expectancy: 0, max_drawdown_pct: 0 },
+        telegram: { enabled: false, configured: false, masked_token: "", chat_id: "", last_status: "غير مرتبط", last_report_date: "" },
         cognition: {
           hurst: 0.5, hurst_rank: 50, entropy: 0.5, entropy_rank: 50,
           velocity: 0, sigma: 0, atr: 1.2, z_score: 0,
@@ -1589,10 +1894,17 @@ HTML_UI = """<!DOCTYPE html>
       const prevPriceRef = useRef(null);
       const wsRef = useRef(null);
 
-      // إعدادات عرض الشارت والتبويبات
+      // حالات التبويب على سطح المكتب والهاتف
       const [showZones, setShowZones] = useState(true);
       const [showVP, setShowVP] = useState(true);
-      const [activeTab, setActiveTab] = useState("POSITION"); // POSITION | HISTORY | STREAM
+      const [desktopDockTab, setDesktopDockTab] = useState("POSITION"); // POSITION | HISTORY | TELEGRAM
+      const [mobileNav, setMobileNav] = useState("CHART"); // CHART | CORTEX | LOGS | TELEGRAM
+
+      // حقول إعدادات تلغرام
+      const [tgTokenInput, setTgTokenInput] = useState("");
+      const [tgChatInput, setTgChatInput] = useState("");
+      const [tgEnabledInput, setTgEnabledInput] = useState(true);
+      const tgLoadedRef = useRef(false);
 
       useEffect(() => {
         let timer;
@@ -1615,6 +1927,12 @@ HTML_UI = """<!DOCTYPE html>
             }
             if (data.price !== undefined) prevPriceRef.current = data.price;
 
+            if (data.telegram && !tgLoadedRef.current) {
+              setTgChatInput(data.telegram.chat_id || "");
+              setTgEnabledInput(Boolean(data.telegram.enabled));
+              tgLoadedRef.current = true;
+            }
+
             if (data.type === "INIT_SNAPSHOT") {
               if (data.candles) setSnapshotCandles(data.candles);
               setState(prev => ({ ...prev, ...data }));
@@ -1632,15 +1950,23 @@ HTML_UI = """<!DOCTYPE html>
         return () => clearTimeout(timer);
       }, []);
 
-      const sendCommand = (command) => {
+      const sendCommand = (command, extra = {}) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ command }));
+          wsRef.current.send(JSON.stringify({ command, ...extra }));
         }
       };
 
-      const { cognition: cog, kpis, open_position: pos, session } = state;
+      const saveTelegramSettings = (e) => {
+        e.preventDefault();
+        sendCommand("SAVE_TELEGRAM", {
+          bot_token: tgTokenInput,
+          chat_id: tgChatInput,
+          enabled: tgEnabledInput,
+        });
+      };
 
-      // حساب نسبة تقدم السعر بين الوقف والهدف للصفقة المفتوحة
+      const { cognition: cog, kpis, open_position: pos, session, telegram: tg } = state;
+
       const posProgress = useMemo(() => {
         if (!pos || !state.price) return 50;
         const totalSpan = Math.abs(pos.tp - pos.sl);
@@ -1655,131 +1981,459 @@ HTML_UI = """<!DOCTYPE html>
         return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
       };
 
-      return (
-        <div className="min-h-screen flex flex-col p-3 lg:p-4 gap-3.5 max-w-[1920px] mx-auto select-none">
+      // مكون فرعي: بطاقة الصفقة النشطة (متجاوب للهاتف وسطح المكتب)
+      const renderActivePosition = () => {
+        if (!pos) {
+          return (
+            <div className="py-5 text-center text-xs text-slate-400">
+              لا توجد صفقة نشطة حالياً — الوكيل يفحص هياكل السيولة (SMC) وإنتروبيا السوق.
+            </div>
+          );
+        }
+        return (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 text-xs">
+              <div className="glass-pill p-2.5">
+                <span className="text-[10px] text-slate-400 block">الاتجاه / اللوت</span>
+                <span className={`font-extrabold mono text-sm ${pos.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {pos.side} ({pos.lots}L)
+                </span>
+              </div>
+              <div className="glass-pill p-2.5">
+                <span className="text-[10px] text-slate-400 block">سعر الدخول</span>
+                <span className="font-bold mono text-sm text-sky-300">${pos.entry_price.toFixed(2)}</span>
+              </div>
+              <div className="glass-pill p-2.5">
+                <span className="text-[10px] text-slate-400 block">السعر الحالي</span>
+                <span className="font-bold mono text-sm text-white">${pos.current_price.toFixed(2)}</span>
+              </div>
+              <div className="glass-pill p-2.5">
+                <span className="text-[10px] text-slate-400 block">الوقف (SL)</span>
+                <span className="font-bold mono text-sm text-rose-400">${pos.sl.toFixed(2)}</span>
+              </div>
+              <div className="glass-pill p-2.5">
+                <span className="text-[10px] text-slate-400 block">الهدف (TP)</span>
+                <span className="font-bold mono text-sm text-emerald-400">${pos.tp.toFixed(2)}</span>
+              </div>
+              <div className="glass-pill p-2.5">
+                <span className="text-[10px] text-slate-400 block">العائد (R)</span>
+                <span className={`font-bold mono text-sm ${(pos.r_multiple || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                  {(pos.r_multiple || 0) >= 0 ? '+' : ''}{Number(pos.r_multiple || 0).toFixed(2)}R
+                </span>
+              </div>
+              <div className="glass-pill p-2.5 col-span-2 sm:col-span-1">
+                <span className="text-[10px] text-slate-400 block">الربح اللحظي</span>
+                <span className={`font-extrabold mono text-sm ${pos.unrealized_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
+                </span>
+              </div>
+            </div>
 
-          {/* 1. الشريط القيادي العلوي (Apple Glass Command Header) */}
-          <header className="glass-card px-4 py-3 flex flex-wrap items-center justify-between gap-4">
-            {/* الهوية ومصدر البث */}
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-3">
-                <div className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-amber-500/10 border border-amber-500/25">
+            <div className="glass-pill p-3">
+              <div className="flex items-center justify-between text-[11px] mb-1.5">
+                <span className="text-rose-400 mono font-semibold">SL: ${pos.sl.toFixed(2)}</span>
+                <span className="text-slate-300 text-[11px]">
+                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+)' : '⏳ تحت المراقبة الحية'}
+                </span>
+                <span className="text-emerald-400 mono font-semibold">TP: ${pos.tp.toFixed(2)}</span>
+              </div>
+              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-rose-500 via-amber-400 to-emerald-400 transition-all duration-300"
+                  style={{ width: `${posProgress}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      // مكون فرعي: سجل الصفقات (بطاقات على الهاتف + جدول على سطح المكتب)
+      const renderTradeHistory = () => {
+        if (state.trade_log.length === 0) {
+          return <div className="py-6 text-center text-xs text-slate-400">لا توجد صفقات مغلقة في السجل بعد.</div>;
+        }
+        return (
+          <div>
+            {/* عرض البطاقات المدمجة للهاتف */}
+            <div className="space-y-2 md:hidden max-h-[380px] overflow-y-auto pr-1">
+              {state.trade_log.map((t) => (
+                <div key={t.id} className="glass-pill p-3 space-y-1.5 text-xs">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className={`px-2 py-0.5 rounded font-bold mono ${
+                        t.side === 'BUY' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'
+                      }`}>
+                        {t.side} ({t.lots}L)
+                      </span>
+                      <span className="mono text-[11px] text-slate-400">{t.closed_at}</span>
+                    </div>
+                    <span className={`font-extrabold mono text-sm ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {t.pnl >= 0 ? '+' : ''}${Number(t.pnl).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-slate-300 mono">
+                    <span>دخول: ${Number(t.entry_price).toFixed(2)}</span>
+                    <span>←</span>
+                    <span>خروج: ${Number(t.exit_price).toFixed(2)}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">{t.reason_exit}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* عرض الجدول لسطح المكتب */}
+            <div className="hidden md:block overflow-x-auto max-h-56">
+              <table className="w-full text-right text-xs">
+                <thead className="text-[11px] text-slate-400 border-b border-white/10">
+                  <tr>
+                    <th className="pb-2">التوقيت</th>
+                    <th className="pb-2">النوع</th>
+                    <th className="pb-2">الدخول</th>
+                    <th className="pb-2">الخروج</th>
+                    <th className="pb-2">اللوت</th>
+                    <th className="pb-2">الصافي</th>
+                    <th className="pb-2">سبب الخروج المستقل</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/[0.05]">
+                  {state.trade_log.map((t) => (
+                    <tr key={t.id} className="hover:bg-white/[0.02]">
+                      <td className="py-2 mono text-slate-400">{t.closed_at}</td>
+                      <td className={`py-2 mono font-bold ${t.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>{t.side}</td>
+                      <td className="py-2 mono">${Number(t.entry_price).toFixed(2)}</td>
+                      <td className="py-2 mono">${Number(t.exit_price).toFixed(2)}</td>
+                      <td className="py-2 mono">{t.lots}</td>
+                      <td className={`py-2 mono font-bold ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {t.pnl >= 0 ? '+' : ''}${Number(t.pnl).toFixed(2)}
+                      </td>
+                      <td className="py-2 text-slate-300">{t.reason_exit}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      };
+
+      // مكون فرعي: لوحة إعدادات تلغرام والتقرير اليومي
+      const renderTelegramSettings = () => (
+        <div className="space-y-3 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2 glass-pill p-3">
+            <div>
+              <div className="font-bold text-slate-200 flex items-center gap-2">
+                <span>حالة الربط بتلغرام:</span>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                  tg.configured ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                }`}>
+                  {tg.configured ? 'مُفعّل ومتصل' : 'بانتظار الإعداد'}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1">{tg.last_status}</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => sendCommand("TEST_TELEGRAM")}
+                className="px-3 py-1.5 rounded-lg font-bold bg-sky-500/15 text-sky-300 border border-sky-500/30 hover:bg-sky-500/25 transition"
+              >
+                🔔 إرسال رسالة اختبار
+              </button>
+              <button
+                type="button"
+                onClick={() => sendCommand("SEND_DAILY_REPORT_NOW")}
+                className="px-3 py-1.5 rounded-lg font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 transition"
+              >
+                📊 إرسال التقرير اليومي الآن
+              </button>
+            </div>
+          </div>
+
+          <form onSubmit={saveTelegramSettings} className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+            <div className="sm:col-span-5">
+              <label className="block text-[11px] text-slate-400 mb-1">
+                توكن البوت (Bot Token) {tg.masked_token ? `[الحالي: ${tg.masked_token}]` : ''}:
+              </label>
+              <input
+                type="password"
+                value={tgTokenInput}
+                onChange={(e) => setTgTokenInput(e.target.value)}
+                placeholder={tg.masked_token ? "اتركه فارغاً للإبقاء على التوكن المحفوظ" : "123456789:ABCdef..."}
+                className="w-full px-3 py-2 rounded-xl bg-slate-900/90 border border-white/10 text-slate-100 mono text-xs focus:outline-none focus:border-amber-400"
+              />
+            </div>
+            <div className="sm:col-span-4">
+              <label className="block text-[11px] text-slate-400 mb-1">
+                معرف القناة أو الحساب (Chat ID / @channel):
+              </label>
+              <input
+                type="text"
+                value={tgChatInput}
+                onChange={(e) => setTgChatInput(e.target.value)}
+                placeholder="-1001234567890 أو @channel"
+                className="w-full px-3 py-2 rounded-xl bg-slate-900/90 border border-white/10 text-slate-100 mono text-xs focus:outline-none focus:border-amber-400"
+              />
+            </div>
+            <div className="sm:col-span-3 flex items-center gap-2">
+              <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 text-xs select-none">
+                <input
+                  type="checkbox"
+                  checked={tgEnabledInput}
+                  onChange={(e) => setTgEnabledInput(e.target.checked)}
+                  className="rounded accent-emerald-500 w-4 h-4"
+                />
+                <span>تفعيل</span>
+              </label>
+              <button
+                type="submit"
+                className="flex-1 px-3 py-2 rounded-xl font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 transition"
+              >
+                حفظ الربط
+              </button>
+            </div>
+          </form>
+
+          <div className="text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2 pt-1">
+            <span>• يرسل البوت تلقائياً: إشعار الدخول (SL/TP) + إشعار التأمين + نتيجة الخروج النهائية.</span>
+            <span>• التقرير اليومي يُرسل تلقائياً بعد إغلاق السوق عند الساعة <b className="mono text-amber-300">21:01 UTC</b>.</span>
+          </div>
+        </div>
+      );
+
+      // مكون فرعي: لوحة القشرة الكمية (Cortex)
+      const renderCortexPanel = () => (
+        <div className="glass-card p-3.5 sm:p-4 flex flex-col gap-3.5">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-xs font-extrabold text-amber-400 tracking-wide">القشرة الكمية والهيكلية (Cortex)</h2>
+              <p className="text-[11px] text-slate-400 mt-0.5">{cog.block_reason}</p>
+            </div>
+            <div className="glass-pill px-3 py-1 text-right">
+              <span className="text-[10px] text-slate-400 block">قناعة الدخول</span>
+              <span className="text-sm font-extrabold text-amber-300 mono">{cog.confidence}%</span>
+            </div>
+          </div>
+
+          <div className="w-full h-2 bg-slate-800/90 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-l from-emerald-400 via-amber-400 to-sky-400 transition-all duration-300"
+              style={{ width: `${Math.min(100, cog.confidence)}%` }}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="glass-pill p-2.5">
+              <div className="text-[10px] text-slate-400">النظام المكتشف</div>
+              <div className="font-bold text-slate-100 mt-0.5 mono text-[11px] truncate">{cog.regime}</div>
+            </div>
+            <div className="glass-pill p-2.5">
+              <div className="text-[10px] text-slate-400">السياسة النشطة</div>
+              <div className="font-bold text-sky-400 mt-0.5 mono text-[11px] truncate">{cog.policy}</div>
+            </div>
+            <div className="glass-pill p-2.5">
+              <div className="flex items-center justify-between text-[10px] text-slate-400">
+                <span>هيرست (Hurst)</span>
+                <span className="mono text-emerald-400">{cog.hurst_rank}%</span>
+              </div>
+              <div className="font-bold text-emerald-300 mt-0.5 mono text-sm">{Number(cog.hurst).toFixed(3)}</div>
+            </div>
+            <div className="glass-pill p-2.5">
+              <div className="flex items-center justify-between text-[10px] text-slate-400">
+                <span>إنتروبيا شانون</span>
+                <span className="mono text-amber-400">{cog.entropy_rank}%</span>
+              </div>
+              <div className="font-bold text-amber-300 mt-0.5 mono text-sm">{Number(cog.entropy).toFixed(3)}</div>
+            </div>
+            <div className="glass-pill p-2.5">
+              <div className="text-[10px] text-slate-400">المدى الحقيقي (ATR)</div>
+              <div className="font-bold text-purple-300 mt-0.5 mono text-sm">${Number(cog.atr || 0).toFixed(2)}</div>
+            </div>
+            <div className="glass-pill p-2.5">
+              <div className="text-[10px] text-slate-400">الانحراف (Z-Score)</div>
+              <div className="font-bold text-slate-200 mt-0.5 mono text-sm">{Number(cog.z_score || 0).toFixed(2)}σ</div>
+            </div>
+          </div>
+
+          <div className="glass-pill p-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+            <span className="text-slate-400 font-semibold">Volume Profile:</span>
+            <div className="flex items-center gap-2.5 mono">
+              <span className="text-slate-300">VAL: <b>${cog.val ? cog.val.toFixed(2) : '--'}</b></span>
+              <span className="text-purple-300">POC: <b>${cog.poc ? cog.poc.toFixed(2) : '--'}</b></span>
+              <span className="text-slate-300">VAH: <b>${cog.vah ? cog.vah.toFixed(2) : '--'}</b></span>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">مناطق الشذوذ والجاذبية السعرية (KDE):</div>
+            <div className="grid grid-cols-2 gap-1.5 text-xs">
+              {state.discovered_zones.map((z, idx) => (
+                <div key={idx} className="glass-pill px-2.5 py-1.5 flex items-center justify-between">
+                  <span className={`mono font-bold ${z.type === 'REPULSOR_ANOMALY' ? 'text-amber-300' : 'text-sky-300'}`}>
+                    ${z.price.toFixed(2)}
+                  </span>
+                  <span className="text-[10px] text-slate-400">
+                    {z.type === 'REPULSOR_ANOMALY' ? 'رفض' : 'جاذبية'} ({z.strength}%)
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="pt-2 border-t border-white/[0.06]">
+            <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">أوزان التعلم المعزز:</div>
+            <div className="grid grid-cols-3 gap-1.5 text-[11px] mono">
+              {Object.entries(cog.weights || {}).map(([k, v]) => (
+                <div key={k} className="glass-pill px-2 py-1 text-center">
+                  <span className="text-slate-400 block text-[9px]">{k.split('_')[0]}</span>
+                  <span className="text-amber-300 font-bold">{v}x</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+
+      // مكون فرعي: مجرى التفكير الحي
+      const renderNeuralStream = () => (
+        <div className="glass-card p-3.5 sm:p-4 flex-1 flex flex-col min-h-[260px]">
+          <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-white/[0.06]">
+            <h3 className="text-xs font-extrabold text-slate-200">مجرى التفكير والاستنتاج الحي (Neural Stream)</h3>
+            <span className="text-[10px] text-emerald-400 mono">LIVE</span>
+          </div>
+          <div className="flex-1 overflow-y-auto space-y-2 pr-1 text-xs max-h-[340px]">
+            {state.thoughts.length === 0 ? (
+              <div className="text-slate-500 text-center py-8">بانتظار تدفق البيانات لتحليل السوق...</div>
+            ) : (
+              state.thoughts.map((th, i) => (
+                <div key={i} className="glass-pill p-2.5 transition hover:border-white/15">
+                  <div className="flex items-center justify-between text-[10px] mb-1">
+                    <span className={`px-2 py-0.5 rounded border font-semibold mono ${categoryBadge(th.category)}`}>
+                      {th.category}
+                    </span>
+                    <span className="mono text-slate-400">{th.time}</span>
+                  </div>
+                  <p className="text-slate-200 leading-relaxed">{th.text}</p>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      );
+
+      return (
+        <div className="min-h-screen flex flex-col p-2.5 sm:p-3.5 lg:p-4 pb-20 lg:pb-4 gap-3 max-w-[1920px] mx-auto select-none">
+
+          {/* 1. الشريط القيادي العلوي المتجاوب (Mobile-First Command Header) */}
+          <header className="glass-card p-3 flex flex-col gap-2.5">
+            {/* الصف الأول: الهوية + السعر اللحظي + أزرار التحكم السريعة */}
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2.5">
+                <div className="relative flex items-center justify-center w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-amber-500/10 border border-amber-500/25 shrink-0">
                   <span className={`w-2.5 h-2.5 rounded-full ${connected ? 'bg-emerald-400 dot-live' : 'bg-rose-500'}`}></span>
                 </div>
                 <div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-extrabold text-lg tracking-tight text-white mono">XAU/USD</span>
-                    <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/25">
-                      QUANT + SMC CORTEX v2
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="font-extrabold text-base sm:text-lg tracking-tight text-white mono">XAU/USD</span>
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/25">
+                      SMC v3
                     </span>
-                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-white/5 text-slate-300 border border-white/10">
+                    <span className="hidden sm:inline-block text-[10px] px-2 py-0.5 rounded-full bg-white/5 text-slate-300 border border-white/10">
                       {session?.label}
                     </span>
                   </div>
-                  <p className="text-[11px] text-slate-400 mono mt-0.5">{state.feed_source}</p>
+                  <p className="text-[10px] text-slate-400 mono truncate max-w-[190px] sm:max-w-none">{state.feed_source}</p>
                 </div>
               </div>
 
-              <div className="h-9 w-[1px] bg-white/10 hidden xl:block"></div>
-
-              {/* السعر اللحظي و Bid/Ask */}
-              <div className="flex items-center gap-3">
-                <div>
-                  <div className="text-[10px] text-slate-400">سعر الذهب الفوري (CFD)</div>
-                  <div className={`text-2xl font-extrabold transition-colors duration-200 mono ${priceFlash}`}>
+              {/* السعر والسبريد */}
+              <div className="flex items-center gap-2.5">
+                <div className="text-left sm:text-right">
+                  <div className={`text-xl sm:text-2xl font-extrabold transition-colors duration-200 mono ${priceFlash}`}>
                     {state.price ? `$${Number(state.price).toFixed(2)}` : '--.--'}
                   </div>
+                  <div className="text-[10px] text-slate-400 mono">
+                    Spd: <b className="text-amber-300">${Number(state.spread).toFixed(2)}</b>
+                  </div>
                 </div>
-                <div className="glass-pill px-2.5 py-1 text-[11px] mono flex flex-col justify-center">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-slate-400">Spread:</span>
-                    <span className="text-amber-300 font-semibold">${Number(state.spread).toFixed(2)}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-2 text-[10px] text-slate-400">
-                    <span>B: {state.bid ? state.bid.toFixed(2) : '--'}</span>
-                    <span>/</span>
-                    <span>A: {state.ask ? state.ask.toFixed(2) : '--'}</span>
-                  </div>
+
+                {/* أزرار التحكم المدمجة */}
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => sendCommand('TOGGLE_LOT_MODE')}
+                    className="px-2.5 py-1.5 rounded-xl text-[11px] font-semibold bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition"
+                  >
+                    {state.lot_mode === 'FIXED_001' ? '0.01L' : 'Risk%'}
+                  </button>
+                  <button
+                    onClick={() => sendCommand('TOGGLE_BOT')}
+                    className={`px-2.5 sm:px-3 py-1.5 rounded-xl text-[11px] font-bold transition border ${
+                      state.bot_active
+                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                        : 'bg-slate-800/80 text-slate-300 border-slate-700'
+                    }`}
+                  >
+                    {state.bot_active ? 'نشط' : 'متوقف'}
+                  </button>
+                  {pos && (
+                    <button
+                      onClick={() => sendCommand('PANIC_CLOSE')}
+                      className="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                    >
+                      إغلاق!
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
 
-            {/* مؤشرات الأداء المالي (KPI Strip) */}
-            <div className="flex flex-wrap items-center gap-2.5">
-              <div className="glass-pill px-3 py-1.5 min-w-[115px]">
-                <div className="text-[10px] text-slate-400">الرصيد (Balance)</div>
-                <div className="text-sm font-bold text-slate-100 mono">
+            {/* الصف الثاني: شريط المؤشرات المالية القابل للتمرير الأفقي على الهاتف */}
+            <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1 border-t border-white/[0.05]">
+              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
+                <div className="text-[9px] text-slate-400">الرصيد (Balance)</div>
+                <div className="text-xs sm:text-sm font-bold text-slate-100 mono">
                   ${Number(state.balance).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                 </div>
               </div>
-              <div className="glass-pill px-3 py-1.5 min-w-[115px]">
-                <div className="text-[10px] text-slate-400">الملكية (Equity)</div>
-                <div className={`text-sm font-bold mono ${state.equity >= state.balance ? 'text-emerald-400' : 'text-rose-400'}`}>
+              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
+                <div className="text-[9px] text-slate-400">الملكية (Equity)</div>
+                <div className={`text-xs sm:text-sm font-bold mono ${state.equity >= state.balance ? 'text-emerald-400' : 'text-rose-400'}`}>
                   ${Number(state.equity).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                 </div>
               </div>
-              <div className="glass-pill px-3 py-1.5 min-w-[105px]">
-                <div className="text-[10px] text-slate-400">نسبة النجاح</div>
-                <div className="text-sm font-bold text-amber-400 mono">
-                  {kpis.win_rate}% <span className="text-[11px] text-slate-400">({kpis.wins}W/{kpis.losses}L)</span>
+              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[100px]">
+                <div className="text-[9px] text-slate-400">نسبة النجاح</div>
+                <div className="text-xs sm:text-sm font-bold text-amber-400 mono">
+                  {kpis.win_rate}% <span className="text-[10px] text-slate-400">({kpis.wins}W/{kpis.losses}L)</span>
                 </div>
               </div>
-              <div className="glass-pill px-3 py-1.5 min-w-[95px]">
-                <div className="text-[10px] text-slate-400">معامل الربح (PF)</div>
-                <div className="text-sm font-bold text-sky-400 mono">
+              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[85px]">
+                <div className="text-[9px] text-slate-400">معامل الربح</div>
+                <div className="text-xs sm:text-sm font-bold text-sky-400 mono">
                   {kpis.profit_factor === null ? '∞' : Number(kpis.profit_factor).toFixed(2)}
                 </div>
               </div>
-              <div className="glass-pill px-3 py-1.5 min-w-[95px]">
-                <div className="text-[10px] text-slate-400">أقصى سحب (DD)</div>
-                <div className="text-sm font-bold text-rose-400 mono">
+              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[85px]">
+                <div className="text-[9px] text-slate-400">أقصى سحب</div>
+                <div className="text-xs sm:text-sm font-bold text-rose-400 mono">
                   {Number(kpis.max_drawdown_pct).toFixed(2)}%
                 </div>
               </div>
-            </div>
-
-            {/* أزرار التحكم السريع */}
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => sendCommand('TOGGLE_LOT_MODE')}
-                className="px-3 py-2 rounded-xl text-xs font-semibold bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition flex items-center gap-1.5"
-                title="تبديل نظام حساب اللوت"
-              >
-                <span className="w-2 h-2 rounded-full bg-sky-400"></span>
-                <span>{state.lot_mode === 'FIXED_001' ? 'اللوت: 0.01 ثابت' : 'اللوت: مخاطرة ديناميكية'}</span>
-              </button>
-
-              <button
-                onClick={() => sendCommand('TOGGLE_BOT')}
-                className={`px-3.5 py-2 rounded-xl text-xs font-bold transition border ${
-                  state.bot_active
-                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25'
-                    : 'bg-slate-800/80 text-slate-300 border-slate-700 hover:bg-slate-700'
-                }`}
-              >
-                {state.bot_active ? 'الوكيل المستقل: نشط' : 'الوكيل المستقل: متوقف'}
-              </button>
-
-              {pos && (
-                <button
-                  onClick={() => sendCommand('PANIC_CLOSE')}
-                  className="px-3.5 py-2 rounded-xl text-xs font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 transition"
-                >
-                  إغلاق فوري طارئ
-                </button>
-              )}
+              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
+                <div className="text-[9px] text-slate-400">إشعارات تلغرام</div>
+                <div className={`text-xs font-bold ${tg.configured ? 'text-emerald-400' : 'text-slate-400'}`}>
+                  {tg.configured ? '✈️ متصل' : 'غير متصل'}
+                </div>
+              </div>
             </div>
           </header>
 
-          {/* 2. الشبكة الرئيسية (Bento Workspace Grid) */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 flex-1">
-
-            {/* العمود الأيمن/الأوسط: الشارت التفاعلي + منصة إدارة الصفقات (8 أعمدة) */}
+          {/* 2. عرض سطح المكتب الكامل (Desktop 12-Col Bento Grid) */}
+          <div className="hidden lg:grid lg:grid-cols-12 gap-3.5 flex-1">
             <div className="lg:col-span-8 flex flex-col gap-3.5">
-
               {/* بطاقة الشارت */}
-              <div className="glass-card p-3.5 flex-1 flex flex-col min-h-[450px]">
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.06]">
+              <div className="glass-card p-3.5 flex-1 flex flex-col">
+                <div className="flex items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.06]">
                   <div className="flex items-center gap-2.5">
                     <span className="text-xs font-bold text-slate-200">شارت الهيكل الكمي والسيولة (XAU/USD {state.tf_min}m)</span>
                     <span className="glass-pill px-2 py-0.5 text-[11px] mono text-amber-300">
@@ -1791,8 +2445,6 @@ HTML_UI = """<!DOCTYPE html>
                       </span>
                     )}
                   </div>
-
-                  {/* أدوات إظهار/إخفاء طبقات الشارت */}
                   <div className="flex items-center gap-2 text-[11px]">
                     <button
                       onClick={() => setShowZones(!showZones)}
@@ -1812,8 +2464,93 @@ HTML_UI = """<!DOCTYPE html>
                     </button>
                   </div>
                 </div>
+                <TradingChart
+                  candles={snapshotCandles}
+                  latestCandle={latestCandle}
+                  zones={state.discovered_zones}
+                  openPos={pos}
+                  poc={cog.poc}
+                  vah={cog.vah}
+                  val={cog.val}
+                  showZones={showZones}
+                  showVP={showVP}
+                />
+              </div>
 
-                <div className="flex-1 w-full rounded-xl overflow-hidden relative">
+              {/* منصة التبويبات السفلية لسطح المكتب */}
+              <div className="glass-card p-4">
+                <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-white/[0.06]">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => setDesktopDockTab("POSITION")}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                        desktopDockTab === "POSITION" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      الصفقة النشطة {pos ? `(#${pos.id})` : ''}
+                    </button>
+                    <button
+                      onClick={() => setDesktopDockTab("HISTORY")}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                        desktopDockTab === "HISTORY" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      سجل الصفقات ({state.trade_log.length})
+                    </button>
+                    <button
+                      onClick={() => setDesktopDockTab("TELEGRAM")}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                        desktopDockTab === "TELEGRAM" ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      ✈️ إشعارات وتقارير تلغرام
+                    </button>
+                  </div>
+                </div>
+
+                {desktopDockTab === "POSITION" && renderActivePosition()}
+                {desktopDockTab === "HISTORY" && renderTradeHistory()}
+                {desktopDockTab === "TELEGRAM" && renderTelegramSettings()}
+              </div>
+            </div>
+
+            <div className="lg:col-span-4 flex flex-col gap-3.5">
+              {renderCortexPanel()}
+              {renderNeuralStream()}
+            </div>
+          </div>
+
+          {/* 3. عرض الهاتف والأجهزة اللوحية الذكي (Mobile Tabbed Views) */}
+          <div className="flex lg:hidden flex-col gap-3 flex-1">
+            {mobileNav === "CHART" && (
+              <>
+                <div className="glass-card p-3 flex flex-col">
+                  <div className="flex items-center justify-between gap-1.5 pb-2 mb-1.5 border-b border-white/[0.06]">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs font-bold text-slate-200">الشارت الحي ({state.tf_min}m)</span>
+                      <span className="glass-pill px-2 py-0.5 text-[10px] mono text-amber-300">
+                        {formatCountdown(state.candle_rem_s || 0)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 text-[10px]">
+                      <button
+                        onClick={() => setShowZones(!showZones)}
+                        className={`px-2 py-0.5 rounded border ${
+                          showZones ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/5'
+                        }`}
+                      >
+                        KDE
+                      </button>
+                      <button
+                        onClick={() => setShowVP(!showVP)}
+                        className={`px-2 py-0.5 rounded border ${
+                          showVP ? 'bg-purple-500/15 text-purple-300 border-purple-500/30' : 'bg-white/5 text-slate-400 border-white/5'
+                        }`}
+                      >
+                        POC
+                      </button>
+                    </div>
+                  </div>
                   <TradingChart
                     candles={snapshotCandles}
                     latestCandle={latestCandle}
@@ -1826,270 +2563,83 @@ HTML_UI = """<!DOCTYPE html>
                     showVP={showVP}
                   />
                 </div>
+
+                {/* بطاقة حالة الوكيل السريعة + الصفقة النشطة تحت الشارت مباشرة على الهاتف */}
+                <div className="glass-card p-3.5">
+                  <div className="flex items-center justify-between mb-2 pb-2 border-b border-white/[0.06]">
+                    <span className="text-xs font-bold text-amber-400">الصفقة النشطة وحالة القرار</span>
+                    <span className="text-[11px] font-bold mono text-amber-300">{cog.confidence}% قناعة</span>
+                  </div>
+                  <p className="text-[11px] text-slate-300 mb-2.5">{cog.block_reason}</p>
+                  {renderActivePosition()}
+                </div>
+              </>
+            )}
+
+            {mobileNav === "CORTEX" && renderCortexPanel()}
+
+            {mobileNav === "LOGS" && (
+              <>
+                <div className="glass-card p-3.5">
+                  <h3 className="text-xs font-extrabold text-slate-200 pb-2 mb-2.5 border-b border-white/[0.06]">
+                    سجل الصفقات ({state.trade_log.length})
+                  </h3>
+                  {renderTradeHistory()}
+                </div>
+                {renderNeuralStream()}
+              </>
+            )}
+
+            {mobileNav === "TELEGRAM" && (
+              <div className="glass-card p-3.5">
+                <h3 className="text-xs font-extrabold text-sky-400 pb-2 mb-3 border-b border-white/[0.06]">
+                  ✈️ إعدادات ربط تلغرام والتقرير اليومي
+                </h3>
+                {renderTelegramSettings()}
               </div>
-
-              {/* منصة العمليات السفلية بنظام التبويبات (Tabbed Dock) */}
-              <div className="glass-card p-4">
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-3 border-b border-white/[0.06]">
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      onClick={() => setActiveTab("POSITION")}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
-                        activeTab === "POSITION" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      الصفقة النشطة {pos ? `(#${pos.id})` : ''}
-                    </button>
-                    <button
-                      onClick={() => setActiveTab("HISTORY")}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
-                        activeTab === "HISTORY" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      سجل الصفقات ({state.trade_log.length})
-                    </button>
-                  </div>
-
-                  <span className={`text-[11px] px-2.5 py-0.5 rounded-full font-semibold ${
-                    pos
-                      ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                      : 'bg-white/5 text-slate-400 border border-white/10'
-                  }`}>
-                    {pos ? `صفقة ${pos.side} مفعّلة — يديرها الوكيل لحظياً` : 'لا توجد صفقة مفتوحة — رصد مستمر'}
-                  </span>
-                </div>
-
-                {/* محتوى التبويب الأول: الصفقة النشطة */}
-                {activeTab === "POSITION" && (
-                  pos ? (
-                    <div className="space-y-3">
-                      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5 text-xs">
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">الاتجاه / العقد</span>
-                          <span className={`font-extrabold mono text-sm ${pos.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {pos.side} ({pos.lots}L)
-                          </span>
-                        </div>
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">سعر الدخول</span>
-                          <span className="font-bold mono text-sm text-sky-300">${pos.entry_price.toFixed(2)}</span>
-                        </div>
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">السعر الحالي</span>
-                          <span className="font-bold mono text-sm text-white">${pos.current_price.toFixed(2)}</span>
-                        </div>
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">الوقف الهيكلي (SL)</span>
-                          <span className="font-bold mono text-sm text-rose-400">${pos.sl.toFixed(2)}</span>
-                        </div>
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">الهدف الهيكلي (TP)</span>
-                          <span className="font-bold mono text-sm text-emerald-400">${pos.tp.toFixed(2)}</span>
-                        </div>
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">العائد للمخاطرة (R)</span>
-                          <span className={`font-bold mono text-sm ${(pos.r_multiple || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
-                            {(pos.r_multiple || 0) >= 0 ? '+' : ''}{Number(pos.r_multiple || 0).toFixed(2)}R
-                          </span>
-                        </div>
-                        <div className="glass-pill p-2.5">
-                          <span className="text-[10px] text-slate-400 block">صافي الربح اللحظي</span>
-                          <span className={`font-extrabold mono text-sm ${pos.unrealized_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* شريط التقدم البصري بين الوقف والهدف */}
-                      <div className="glass-pill p-3">
-                        <div className="flex items-center justify-between text-[11px] mb-1.5">
-                          <span className="text-rose-400 mono font-semibold">SL: ${pos.sl.toFixed(2)}</span>
-                          <span className="text-slate-300 text-[11px]">
-                            {pos.be_secured ? '🛡️ الصفقة مؤمّنة (Break-Even+ مفعل)' : '⏳ قيد المراقبة الهيكلية الحية'}
-                          </span>
-                          <span className="text-emerald-400 mono font-semibold">TP: ${pos.tp.toFixed(2)}</span>
-                        </div>
-                        <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-gradient-to-r from-rose-500 via-amber-400 to-emerald-400 transition-all duration-300"
-                            style={{ width: `${posProgress}%` }}
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="py-6 text-center text-xs text-slate-400">
-                      لا توجد صفقة نشطة حالياً. يقوم الوكيل بفحص تدفق الأوامر، فجوات السعر العادلة (FVG)، وإنتروبيا شانون قبل التنفيذ.
-                    </div>
-                  )
-                )}
-
-                {/* محتوى التبويب الثاني: سجل الصفقات التاريخية */}
-                {activeTab === "HISTORY" && (
-                  <div className="overflow-x-auto max-h-56">
-                    {state.trade_log.length === 0 ? (
-                      <div className="py-6 text-center text-xs text-slate-400">لا توجد صفقات مغلقة في السجل بعد.</div>
-                    ) : (
-                      <table className="w-full text-right text-xs">
-                        <thead className="text-[11px] text-slate-400 border-b border-white/10">
-                          <tr>
-                            <th class="pb-2">التوقيت</th>
-                            <th class="pb-2">النوع</th>
-                            <th class="pb-2">الدخول</th>
-                            <th class="pb-2">الخروج</th>
-                            <th class="pb-2">اللوت</th>
-                            <th class="pb-2">الصافي</th>
-                            <th class="pb-2">سبب الخروج المستقل</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-white/[0.05]">
-                          {state.trade_log.map((t) => (
-                            <tr key={t.id} className="hover:bg-white/[0.02]">
-                              <td className="py-2 mono text-slate-400">{t.closed_at}</td>
-                              <td className={`py-2 mono font-bold ${t.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>{t.side}</td>
-                              <td className="py-2 mono">${Number(t.entry_price).toFixed(2)}</td>
-                              <td className="py-2 mono">${Number(t.exit_price).toFixed(2)}</td>
-                              <td className="py-2 mono">{t.lots}</td>
-                              <td className={`py-2 mono font-bold ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {t.pnl >= 0 ? '+' : ''}${Number(t.pnl).toFixed(2)}
-                              </td>
-                              <td className="py-2 text-slate-300">{t.reason_exit}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* العمود الأيسر: القشرة الكمية (Quantitative Cortex) + مجرى التفكير الحي (4 أعمدة) */}
-            <div className="lg:col-span-4 flex flex-col gap-3.5">
-
-              {/* لوحة الوعي الرياضي */}
-              <div className="glass-card p-4 flex flex-col gap-3.5">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h2 className="text-xs font-extrabold text-amber-400 tracking-wide">القشرة الكمية والهيكلية (Cortex)</h2>
-                    <p className="text-[11px] text-slate-400 mt-0.5">{cog.block_reason}</p>
-                  </div>
-                  <div className="glass-pill px-3 py-1 text-right">
-                    <span className="text-[10px] text-slate-400 block">قناعة الدخول</span>
-                    <span className="text-sm font-extrabold text-amber-300 mono">{cog.confidence}%</span>
-                  </div>
-                </div>
-
-                {/* شريط القناعة */}
-                <div className="w-full h-2 bg-slate-800/90 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-l from-emerald-400 via-amber-400 to-sky-400 transition-all duration-300"
-                    style={{ width: `${Math.min(100, cog.confidence)}%` }}
-                  />
-                </div>
-
-                {/* شبكة المؤشرات الكمية */}
-                <div className="grid grid-cols-2 gap-2.5 text-xs">
-                  <div className="glass-pill p-2.5">
-                    <div className="text-[10px] text-slate-400">النظام المكتشف (Regime)</div>
-                    <div className="font-bold text-slate-100 mt-0.5 mono text-[11px] truncate">{cog.regime}</div>
-                  </div>
-                  <div className="glass-pill p-2.5">
-                    <div className="text-[10px] text-slate-400">السياسة النشطة (Policy)</div>
-                    <div className="font-bold text-sky-400 mt-0.5 mono text-[11px] truncate">{cog.policy}</div>
-                  </div>
-                  <div className="glass-pill p-2.5">
-                    <div className="flex items-center justify-between text-[10px] text-slate-400">
-                      <span>معامل هيرست (Hurst)</span>
-                      <span className="mono text-emerald-400">رتبة {cog.hurst_rank}%</span>
-                    </div>
-                    <div className="font-bold text-emerald-300 mt-0.5 mono text-sm">{Number(cog.hurst).toFixed(3)}</div>
-                  </div>
-                  <div className="glass-pill p-2.5">
-                    <div className="flex items-center justify-between text-[10px] text-slate-400">
-                      <span>إنتروبيا شانون</span>
-                      <span className="mono text-amber-400">رتبة {cog.entropy_rank}%</span>
-                    </div>
-                    <div className="font-bold text-amber-300 mt-0.5 mono text-sm">{Number(cog.entropy).toFixed(3)}</div>
-                  </div>
-                  <div className="glass-pill p-2.5">
-                    <div className="text-[10px] text-slate-400">المدى الحقيقي (ATR 14)</div>
-                    <div className="font-bold text-purple-300 mt-0.5 mono text-sm">${Number(cog.atr || 0).toFixed(2)}</div>
-                  </div>
-                  <div className="glass-pill p-2.5">
-                    <div className="text-[10px] text-slate-400">الانحراف المعياري (Z-Score)</div>
-                    <div className="font-bold text-slate-200 mt-0.5 mono text-sm">{Number(cog.z_score || 0).toFixed(2)}σ</div>
-                  </div>
-                </div>
-
-                {/* بروفيل الحجم التقديري (POC / VAH / VAL) */}
-                <div className="glass-pill p-2.5 flex items-center justify-between text-[11px]">
-                  <span className="text-slate-400 font-semibold">Volume Profile:</span>
-                  <div className="flex items-center gap-3 mono">
-                    <span className="text-slate-300">VAL: <b>${cog.val ? cog.val.toFixed(2) : '--'}</b></span>
-                    <span className="text-purple-300">POC: <b>${cog.poc ? cog.poc.toFixed(2) : '--'}</b></span>
-                    <span className="text-slate-300">VAH: <b>${cog.vah ? cog.vah.toFixed(2) : '--'}</b></span>
-                  </div>
-                </div>
-
-                {/* المناطق المكتشفة ذاتياً */}
-                <div>
-                  <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">مناطق الشذوذ والجاذبية السعرية (KDE):</div>
-                  <div className="grid grid-cols-2 gap-1.5 text-xs">
-                    {state.discovered_zones.map((z, idx) => (
-                      <div key={idx} className="glass-pill px-2.5 py-1.5 flex items-center justify-between">
-                        <span className={`mono font-bold ${z.type === 'REPULSOR_ANOMALY' ? 'text-amber-300' : 'text-sky-300'}`}>
-                          ${z.price.toFixed(2)}
-                        </span>
-                        <span className="text-[10px] text-slate-400">
-                          {z.type === 'REPULSOR_ANOMALY' ? 'رفض' : 'جاذبية'} ({z.strength}%)
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* أوزان التعلم الذاتي للسياسات */}
-                <div className="pt-2 border-t border-white/[0.06]">
-                  <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">أوزان التعلم المعزز (Reinforcement Weights):</div>
-                  <div className="grid grid-cols-3 gap-1.5 text-[11px] mono">
-                    {Object.entries(cog.weights || {}).map(([k, v]) => (
-                      <div key={k} className="glass-pill px-2 py-1 text-center">
-                        <span className="text-slate-400 block text-[9px]">{k.split('_')[0]}</span>
-                        <span className="text-amber-300 font-bold">{v}x</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* سجل التفكير والاستنتاج الحي */}
-              <div className="glass-card p-4 flex-1 flex flex-col min-h-[290px]">
-                <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-white/[0.06]">
-                  <h3 className="text-xs font-extrabold text-slate-200">مجرى التفكير والاستنتاج الحي (Neural Stream)</h3>
-                  <span className="text-[10px] text-emerald-400 mono">LIVE COGNITION</span>
-                </div>
-                <div className="flex-1 overflow-y-auto space-y-2 pr-1 text-xs max-h-[340px]">
-                  {state.thoughts.length === 0 ? (
-                    <div className="text-slate-500 text-center py-8">بانتظار تدفق البيانات لتحليل السوق...</div>
-                  ) : (
-                    state.thoughts.map((th, i) => (
-                      <div key={i} className="glass-pill p-2.5 transition hover:border-white/15">
-                        <div className="flex items-center justify-between text-[10px] mb-1">
-                          <span className={`px-2 py-0.5 rounded border font-semibold mono ${categoryBadge(th.category)}`}>
-                            {th.category}
-                          </span>
-                          <span className="mono text-slate-400">{th.time}</span>
-                        </div>
-                        <p className="text-slate-200 leading-relaxed">{th.text}</p>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-            </div>
+            )}
           </div>
+
+          {/* 4. شريط التنقل السفلي العائم للهاتف (iOS Style Bottom Tab Bar) */}
+          <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#090D15]/95 backdrop-blur-xl border-t border-white/10 px-2 py-1.5 flex items-center justify-around">
+            <button
+              onClick={() => setMobileNav("CHART")}
+              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
+                mobileNav === "CHART" ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400'
+              }`}
+            >
+              <span>📈</span>
+              <span>الشارت والصفقة</span>
+            </button>
+            <button
+              onClick={() => setMobileNav("CORTEX")}
+              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
+                mobileNav === "CORTEX" ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400'
+              }`}
+            >
+              <span>🧠</span>
+              <span>الوعي الكمي</span>
+            </button>
+            <button
+              onClick={() => setMobileNav("LOGS")}
+              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
+                mobileNav === "LOGS" ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400'
+              }`}
+            >
+              <span>📜</span>
+              <span>السجل والأفكار</span>
+            </button>
+            <button
+              onClick={() => setMobileNav("TELEGRAM")}
+              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
+                mobileNav === "TELEGRAM" ? 'text-sky-400 bg-sky-500/10' : 'text-slate-400'
+              }`}
+            >
+              <span>✈️</span>
+              <span>التلغرام</span>
+            </button>
+          </nav>
+
         </div>
       );
     }
