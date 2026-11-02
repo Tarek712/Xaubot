@@ -190,30 +190,18 @@ class TelegramNotifier:
         icon = "🟢" if pos["side"] == "BUY" else "🔴"
         direction_ar = "شراء (BUY)" if pos["side"] == "BUY" else "بيع (SELL)"
         msg = (
-            f"{icon} <b>دخول صفقة ذهب جديدة | XAU/USD</b>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})
-"
-            f"📦 <b>حجم العقد:</b> <code>{pos['lots']} Lot</code>
-"
-            f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>
-"
-            f"🛡️ <b>الوقف الهيكلي (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})
-"
-            f"🏆 <b>الهدف الهيكلي (TP):</b> <code>${pos['tp']:.2f}</code>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"🧠 <b>القناعة الكمية:</b> <code>{pos['confidence']}%</code>
-"
-            f"⚙️ <b>السياسة:</b> <code>{pos['policy']}</code>
-"
-            f"📊 <b>حالة السوق:</b> <code>{pos['regime']}</code>
-"
-            f"🌍 <b>الجلسة:</b> {session_label}
-"
+            f"{icon} <b>دخول صفقة ذهب جديدة | XAU/USD</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})\n"
+            f"📦 <b>حجم العقد:</b> <code>{pos['lots']} Lot</code>\n"
+            f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>\n"
+            f"🛡️ <b>الوقف الهيكلي (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})\n"
+            f"🏆 <b>الهدف الهيكلي (TP):</b> <code>${pos['tp']:.2f}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 <b>القناعة الكمية:</b> <code>{pos['confidence']}%</code>\n"
+            f"⚙️ <b>السياسة:</b> <code>{pos['policy']}</code>\n"
+            f"📊 <b>حالة السوق:</b> <code>{pos['regime']}</code>\n"
+            f"🌍 <b>الجلسة:</b> {session_label}\n"
             f"🕒 <b>التوقيت:</b> <code>{pos['opened_at']} UTC</code>"
         )
         await self.send_html(msg)
@@ -222,16 +210,11 @@ class TelegramNotifier:
         if not self.is_configured():
             return
         msg = (
-            f"🛡️ <b>تأمين صفقة نشطة | XAU/USD (#{pos['id']})</b>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"📌 <b>النوع:</b> <code>{pos['side']} ({pos['lots']}L)</code>
-"
-            f"🔒 <b>الوقف المحدث (SL):</b> <code>${pos['sl']:.2f}</code>
-"
-            f"💵 <b>الربح المحجوز/الجزئي:</b> <code>${pos['realized']:+.2f}</code>
-"
+            f"🛡️ <b>تأمين صفقة نشطة | XAU/USD (#{pos['id']})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>النوع:</b> <code>{pos['side']} ({pos['lots']}L)</code>\n"
+            f"🔒 <b>الوقف المحدث (SL):</b> <code>${pos['sl']:.2f}</code>\n"
+            f"💵 <b>الربح المحجوز/الجزئي:</b> <code>${pos['realized']:+.2f}</code>\n"
             f"📝 <b>التفاصيل:</b> {note}"
         )
         await self.send_html(msg)
@@ -244,26 +227,16 @@ class TelegramNotifier:
         pnl_str = f"+${rec['pnl']:.2f}" if win else f"-${abs(rec['pnl']):.2f}"
         r_str = f"{r_mult:+.2f}R"
         msg = (
-            f"{badge} | <b>XAU/USD (#{rec['id']})</b>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"📌 <b>الاتجاه والعقد:</b> <code>{rec['side']} ({rec['lots']} Lot)</code>
-"
-            f"📥 <b>سعر الدخول:</b> <code>${rec['entry_price']:.2f}</code>
-"
-            f"📤 <b>سعر الخروج:</b> <code>${rec['exit_price']:.2f}</code>
-"
-            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_str})</code>
-"
-            f"📝 <b>سبب الخروج:</b> {rec['reason_exit']}
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"🏦 <b>الرصيد المحدث:</b> <code>${balance:,.2f}</code>
-"
-            f"📈 <b>نسبة النجاح الكلية:</b> <code>{kpis['win_rate']}% ({kpis['wins']}W/{kpis['losses']}L)</code>
-"
+            f"{badge} | <b>XAU/USD (#{rec['id']})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>الاتجاه والعقد:</b> <code>{rec['side']} ({rec['lots']} Lot)</code>\n"
+            f"📥 <b>سعر الدخول:</b> <code>${rec['entry_price']:.2f}</code>\n"
+            f"📤 <b>سعر الخروج:</b> <code>${rec['exit_price']:.2f}</code>\n"
+            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_str})</code>\n"
+            f"📝 <b>سبب الخروج:</b> {rec['reason_exit']}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 <b>الرصيد المحدث:</b> <code>${balance:,.2f}</code>\n"
+            f"📈 <b>نسبة النجاح الكلية:</b> <code>{kpis['win_rate']}% ({kpis['wins']}W/{kpis['losses']}L)</code>\n"
             f"🕒 <b>وقت الإغلاق:</b> <code>{rec['closed_at']} UTC</code>"
         )
         await self.send_html(msg)
@@ -277,33 +250,20 @@ class TelegramNotifier:
         weights_txt = " | ".join([f"{k.split('_')[0]}: {v}x" for k, v in report["weights"].items()])
 
         msg = (
-            f"📊 <b>التقرير اليومي لإغلاق سوق الذهب | XAU/USD</b>
-"
-            f"📅 <b>التاريخ:</b> <code>{report['date']}</code>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
+            f"📊 <b>التقرير اليومي لإغلاق سوق الذهب | XAU/USD</b>\n"
+            f"📅 <b>التاريخ:</b> <code>{report['date']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
             f"🔢 <b>صفقات اليوم:</b> <code>{report['daily_total']}</code> "
-            f"(رابحة: <code>{report['daily_wins']}</code> | خاسرة: <code>{report['daily_losses']}</code>)
-"
-            f"🎯 <b>نسبة نجاح اليوم:</b> <code>{report['daily_win_rate']}%</code>
-"
-            f"{net_icon} <b>صافي ربح/خسارة اليوم:</b> <code>{net_str} ({report['daily_return_pct']:+.2f}%)</code>
-"
-            f"🏆 <b>أفضل صفقة اليوم:</b> <code>+${report['best_trade']:.2f}</code>
-"
-            f"⚠️ <b>أسوأ صفقة اليوم:</b> <code>${report['worst_trade']:.2f}</code>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"🏦 <b>إجمالي الرصيد الحالي:</b> <code>${report['balance']:,.2f}</code>
-"
-            f"📈 <b>إجمالي الصافي الكلي:</b> <code>${report['total_net_pnl']:+,.2f}</code>
-"
-            f"🛡️ <b>أقصى سحب مسجل (Max DD):</b> <code>{report['max_dd_pct']:.2f}%</code>
-"
-            f"⚖️ <b>أوزان التعلم الذاتي:</b>
-<code>{weights_txt}</code>"
+            f"(رابحة: <code>{report['daily_wins']}</code> | خاسرة: <code>{report['daily_losses']}</code>)\n"
+            f"🎯 <b>نسبة نجاح اليوم:</b> <code>{report['daily_win_rate']}%</code>\n"
+            f"{net_icon} <b>صافي ربح/خسارة اليوم:</b> <code>{net_str} ({report['daily_return_pct']:+.2f}%)</code>\n"
+            f"🏆 <b>أفضل صفقة اليوم:</b> <code>+${report['best_trade']:.2f}</code>\n"
+            f"⚠️ <b>أسوأ صفقة اليوم:</b> <code>${report['worst_trade']:.2f}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 <b>إجمالي الرصيد الحالي:</b> <code>${report['balance']:,.2f}</code>\n"
+            f"📈 <b>إجمالي الصافي الكلي:</b> <code>${report['total_net_pnl']:+,.2f}</code>\n"
+            f"🛡️ <b>أقصى سحب مسجل (Max DD):</b> <code>{report['max_dd_pct']:.2f}%</code>\n"
+            f"⚖️ <b>أوزان التعلم الذاتي:</b>\n<code>{weights_txt}</code>"
         )
         return await self.send_html(msg, force=force)
 
@@ -453,6 +413,12 @@ class AutonomousQuantitativeBrain:
                         self.tg.last_status = "مُحمّل من الذاكرة الدائمة" if self.tg.is_configured() else "غير مُفعّل"
                     elif k == "last_report_date":
                         self.tg.last_report_date = str(parsed)
+
+                # الربح الجزئي المحجوز لصفقة مفتوحة أُضيف للرصيد سابقاً ولا يظهر في trade_history
+                if self.open_position:
+                    self.balance = round(self.balance + float(self.open_position.get("realized", 0.0)), 2)
+                    self.equity = self.balance
+                    self.peak_balance = max(self.peak_balance, self.balance)
             finally:
                 conn.close()
         except Exception as e:
@@ -1569,16 +1535,11 @@ async def websocket_endpoint(ws: WebSocket):
 
                 elif cmd == "TEST_TELEGRAM":
                     test_msg = (
-                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Quant Cortex</b>
-"
-                        "━━━━━━━━━━━━━━━━━━
-"
-                        f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.
-"
-                        f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>
-"
-                        f"📊 <b>سعر الذهب الحي:</b> <code>${brain.last_price or 0.0:.2f}</code>
-"
+                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Quant Cortex</b>\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.\n"
+                        f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>\n"
+                        f"📊 <b>سعر الذهب الحي:</b> <code>${brain.last_price or 0.0:.2f}</code>\n"
                         f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
                     )
                     ok = await brain.tg.send_html(test_msg, force=True)
