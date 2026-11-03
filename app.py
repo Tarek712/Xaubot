@@ -39,16 +39,16 @@ if TF_MIN not in _BN_INT:
 BN_INTERVAL = _BN_INT[TF_MIN]
 TF_SEC = TF_MIN * 60
 
-# --- معايير الفلترة الصارمة لمنع الصفقات الكارثية ---
+# --- معايير الفلترة الصارمة وإدارة المخاطر ---
 MIN_CANDLES = 60                 # أقل عدد شموع قبل بدء التحليل
-MAX_SPREAD = 0.99                # سقف السبريد المسموح للدخول ($0.99 بدلاً من 0.55)
+MAX_SPREAD = 0.99                # سقف السبريد المسموح للدخول ($0.99)
 ASSUMED_SPREAD = 0.25            # سبريد افتراضي عند غياب الفارق
-ENTRY_CONFIDENCE = 86.0          # رفع عتبة القناعة للدخول (86% بدلاً من 82%)
+ENTRY_CONFIDENCE = 86.0          # الحد الأدنى للقناعة للدخول (86%)
 SIGNAL_CONFIRM = 2               # تأكيد الإغلاق لشمعتين
 MIN_SL_DISTANCE = 3.20           # أقل مسافة وقف خسارة مسموحة للذهب ($3.20) لمنع ضرب الذيول
-MAX_SL_DISTANCE = 6.50           # أقصى مسافة وقف خسارة مسموحة ($6.50)
-TARGET_RR_RATIO = 2.30           # نسبة العائد للمخاطرة المستهدفة (2.3R بدلاً من 1.75R)
-MAX_RISK_PCT_CAP = 0.0035        # سقف المخاطرة في الوضع الديناميكي (0.35% كحد أقصى أي ~35$ على حساب 10k)
+MAX_SL_DISTANCE = 6.50           # أقصى مسافة وقف خسارة افتراضية ($6.50)
+TARGET_RR_RATIO = 2.30           # نسبة العائد للمخاطرة المستهدفة (2.3R)
+MAX_RISK_PCT_CAP = 0.0035        # سقف المخاطرة في الوضع الديناميكي (0.35%)
 MAX_LOT_CAP = 0.10               # سقف اللوت الأقصى للحماية
 
 COOLDOWN_AFTER_WIN_S = 180 * TF_MIN
@@ -71,7 +71,6 @@ def get_active_session() -> Dict[str, str]:
     """تحديد جلسة التداول الحالية وحظر التداول في الساعة الميتة نهاية نيويورك وفترة الـ Rollover."""
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour + now_utc.minute / 60.0
-    # حظر التداول من 20:00 UTC إلى 22:15 UTC (نهاية نيويورك الميتة + Rollover اتساع السبريد)
     if 20.0 <= h < 22.25:
         return {
             "name": "DEADZONE_ROLLOVER",
@@ -88,10 +87,17 @@ def get_active_session() -> Dict[str, str]:
 
 
 # ==============================================================================
-# 1. الذاكرة الدائمة وسجل الصفقات والشموع التاريخية (SQLite Persistence Engine)
+# 1. الذاكرة الدائمة وسجل الصفقات والشموع التاريخية (SQLite WAL Engine)
 # ==============================================================================
+def get_db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=12.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_conn()
     try:
         c = conn.cursor()
         c.execute("""
@@ -134,7 +140,6 @@ def init_db():
                 value TEXT
             )
         """)
-        # جدول حفظ الشموع التاريخية محلياً لمنع فقدان الشارت عند إعادة تشغيل السيرفر
         c.execute("""
             CREATE TABLE IF NOT EXISTS market_candles (
                 tf_min INTEGER,
@@ -297,7 +302,7 @@ class TelegramNotifier:
 
 
 # ==============================================================================
-# 3. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex v4)
+# 3. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex v5)
 # ==============================================================================
 class AutonomousQuantitativeBrain:
     POLICIES = (
@@ -311,7 +316,7 @@ class AutonomousQuantitativeBrain:
         self.tg = tg
         self.bot_active: bool = True
         self.can_trade: bool = False
-        self.lot_mode: str = "FIXED_001"  # FIXED_001 افتراضي دائماً لحماية الرصيد
+        self.lot_mode: str = "FIXED_001"
         self.balance: float = 100.0
         self.equity: float = 100.0
         self.initial_balance: float = 100.0
@@ -333,6 +338,8 @@ class AutonomousQuantitativeBrain:
         self.z_score: float = 0.0
         self.ema_fast: Optional[float] = None
         self.ema_slow: Optional[float] = None
+        self.ema_fast_series: List[Dict] = []
+        self.ema_slow_series: List[Dict] = []
         self.macro_bias: str = "NEUTRAL"  # BULLISH | BEARISH | NEUTRAL
         self.poc_price: Optional[float] = None
         self.vah_price: Optional[float] = None
@@ -366,7 +373,7 @@ class AutonomousQuantitativeBrain:
 
     def _save_runtime_key(self, key: str, val_obj):
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_conn()
             try:
                 c = conn.cursor()
                 c.execute(
@@ -379,10 +386,26 @@ class AutonomousQuantitativeBrain:
         except Exception as e:
             print("Runtime save error:", repr(e))
 
+    def _update_drawdown(self, current_val: float):
+        """تحديث الذروة وأقصى سحب (Realized & Floating Drawdown) وحفظها في SQLite."""
+        changed = False
+        if current_val > self.peak_balance:
+            self.peak_balance = round(current_val, 2)
+            changed = True
+        if self.peak_balance > 0:
+            dd = round((self.peak_balance - current_val) / self.peak_balance * 100.0, 2)
+            if dd > self.max_drawdown_pct:
+                self.max_drawdown_pct = dd
+                changed = True
+        if changed:
+            self._save_runtime_key("drawdown_metrics", {
+                "peak_balance": self.peak_balance,
+                "max_drawdown_pct": self.max_drawdown_pct,
+            })
+
     def save_candle_to_db(self, candle: Dict):
-        """حفظ الشمعة في SQLite لضمان عدم ضياع الشارت عند إعادة تشغيل السيرفر."""
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_conn()
             try:
                 c = conn.cursor()
                 c.execute(
@@ -402,7 +425,7 @@ class AutonomousQuantitativeBrain:
         if not candles_list:
             return
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_conn()
             try:
                 c = conn.cursor()
                 rows = [(TF_MIN, x["time"], x["open"], x["high"], x["low"], x["close"]) for x in candles_list]
@@ -413,7 +436,6 @@ class AutonomousQuantitativeBrain:
                     """,
                     rows,
                 )
-                # الاحتفاظ بآخر 500 شمعة فقط لكل فريم لمنع تضخم القاعدة
                 c.execute(
                     """
                     DELETE FROM market_candles
@@ -431,7 +453,7 @@ class AutonomousQuantitativeBrain:
 
     def _restore_state(self):
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db_conn()
             try:
                 c = conn.cursor()
                 c.execute(
@@ -482,6 +504,9 @@ class AutonomousQuantitativeBrain:
                         self.lot_mode = parsed
                     elif k == "cooldown_until":
                         self.cooldown_until = float(parsed)
+                    elif k == "drawdown_metrics" and isinstance(parsed, dict):
+                        self.peak_balance = max(self.peak_balance, float(parsed.get("peak_balance", self.peak_balance)))
+                        self.max_drawdown_pct = max(0.0, float(parsed.get("max_drawdown_pct", 0.0)))
                     elif k == "telegram_config" and isinstance(parsed, dict):
                         if parsed.get("bot_token"):
                             self.tg.bot_token = str(parsed["bot_token"]).strip()
@@ -493,7 +518,6 @@ class AutonomousQuantitativeBrain:
                     elif k == "last_report_date":
                         self.tg.last_report_date = str(parsed)
 
-                # استرجاع الشموع التاريخية المحفوظة محلياً
                 c.execute(
                     "SELECT time, open, high, low, close FROM market_candles "
                     "WHERE tf_min = ? ORDER BY time ASC LIMIT 400",
@@ -536,7 +560,7 @@ class AutonomousQuantitativeBrain:
     def build_daily_report_data(self, date_str: Optional[str] = None) -> Dict:
         target_date = date_str or today_utc_str()
         month_day_prefix = target_date[5:]
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -555,7 +579,7 @@ class AutonomousQuantitativeBrain:
         losses = sum(1 for x in rows if x < 0)
         daily_pnl = round(sum(rows), 2)
         win_rate = round((wins / total) * 100.0, 1) if total else 0.0
-        start_day_bal = max(100.0, self.balance - daily_pnl)
+        start_day_bal = max(10.0, self.balance - daily_pnl)
         daily_return_pct = round((daily_pnl / start_day_bal) * 100.0, 2)
         best_trade = round(max(rows), 2) if rows else 0.0
         worst_trade = round(min(rows), 2) if rows else 0.0
@@ -585,16 +609,22 @@ class AutonomousQuantitativeBrain:
 
     # --------------------------------------------------------------- الإحصاء والرياضيات الكمية
     @staticmethod
-    def _ema(arr: np.ndarray, period: int) -> float:
-        if len(arr) == 0:
-            return 0.0
-        if len(arr) < period:
-            return float(np.mean(arr))
+    def compute_ema_array(closes: np.ndarray, period: int) -> np.ndarray:
+        """حساب سلسلة EMA القياسية بمتوسط أولي (SMA Seed) مطابق لـ TradingView."""
+        n = len(closes)
+        if n == 0:
+            return np.array([], dtype=float)
+        out = np.zeros(n, dtype=float)
         alpha = 2.0 / (period + 1.0)
-        val = float(arr[0])
-        for p in arr[1:]:
-            val = alpha * float(p) + (1.0 - alpha) * val
-        return round(val, 2)
+        seed_len = min(period, n)
+        seed = float(np.mean(closes[:seed_len]))
+        for i in range(seed_len):
+            out[i] = float(np.mean(closes[: i + 1]))
+        val = seed
+        for i in range(seed_len, n):
+            val = alpha * float(closes[i]) + (1.0 - alpha) * val
+            out[i] = val
+        return np.round(out, 2)
 
     def compute_hurst_exponent(self, prices: np.ndarray) -> float:
         if len(prices) < 45:
@@ -729,11 +759,9 @@ class AutonomousQuantitativeBrain:
         prev_low = float(np.min(lows[-18:-1]))
         prev_high = float(np.max(highs[-18:-1]))
 
-        # سحب سيولة صاعد مؤكد مع إغلاق إيجابي
         if l1 < prev_low and c1 > prev_low and (lower_wick / rng1) >= 0.42 and c1 >= o1:
             result["bull_sweep"] = True
             result["label"] = "BULL_LIQUIDITY_SWEEP"
-        # سحب سيولة هابط مؤكد مع إغلاق سلبي
         elif h1 > prev_high and c1 < prev_high and (upper_wick / rng1) >= 0.42 and c1 <= o1:
             result["bear_sweep"] = True
             result["label"] = "BEAR_LIQUIDITY_SWEEP"
@@ -751,7 +779,7 @@ class AutonomousQuantitativeBrain:
         return result
 
     def synthesize_optimal_policy(
-        self, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray
+        self, times: np.ndarray, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray
     ) -> Dict:
         returns = np.diff(closes)
         if len(returns) < 40:
@@ -771,9 +799,14 @@ class AutonomousQuantitativeBrain:
         sigma = float(np.std(returns)) + 1e-6
         self.volatility_sigma = round(sigma, 3)
 
-        # حساب الاتجاه الهيكلي الكلي (Macro Trend Filter EMA 50 & EMA 150)
-        self.ema_fast = self._ema(closes[-160:], 50)
-        self.ema_slow = self._ema(closes[-220:], 150)
+        # حساب سلاسل EMA 50 و EMA 150 القياسية على كامل التاريخ للتحليل وللرسم على الشارت
+        ema50_arr = self.compute_ema_array(closes, 50)
+        ema150_arr = self.compute_ema_array(closes, 150)
+        self.ema_fast = float(ema50_arr[-1])
+        self.ema_slow = float(ema150_arr[-1])
+        self.ema_fast_series = [{"time": int(t), "value": float(v)} for t, v in zip(times, ema50_arr)]
+        self.ema_slow_series = [{"time": int(t), "value": float(v)} for t, v in zip(times, ema150_arr)]
+
         cur_close = float(closes[-1])
 
         if self.ema_fast > self.ema_slow + self.atr_value * 0.25 and cur_close > self.ema_fast:
@@ -847,7 +880,6 @@ class AutonomousQuantitativeBrain:
         last_bear_candle = closes[-1] < opens[-1]
 
         if trend_mode:
-            # منع شراء القمة المتشبعة (z_score > 1.65) أو بيع القاع المتشبع (z_score < -1.65)
             if short_drift > 0.24 and med_drift > 0.10 and self.macro_bias != "BEARISH":
                 if z_score > 1.65:
                     reason = f"حظر شراء القمة: السعر متمدد بشدة (Z={z_score:.2f} > 1.65) — بانتظار تصحيح"
@@ -868,14 +900,23 @@ class AutonomousQuantitativeBrain:
             else:
                 conviction = 54.0 + min(15.0, abs(short_drift) * 9.0)
         else:
-            # الارتداد للمتوسط: منع البيع الأعمى ضد الترند الصاعد إلا بوجود Liquidity Sweep مؤكد أو منطقة رفض + شمعة هابطة
             near_repulsor_top = any(
                 z["type"] == "REPULSOR_ANOMALY" and abs(cur_close - z["price"]) <= self.atr_value * 1.2
                 for z in self.discovered_zones
             )
-            if smc["bull_sweep"] or (z_score < -1.55 and last_bull_candle and self.macro_bias != "BEARISH" and ( near_repulsor_top or cur_close <= (self.val_price or cur_close) )):
+            if smc["bull_sweep"] or (
+                z_score < -1.55
+                and last_bull_candle
+                and self.macro_bias != "BEARISH"
+                and (near_repulsor_top or cur_close <= (self.val_price or cur_close))
+            ):
                 direction = 1
-            elif smc["bear_sweep"] or (z_score > 1.55 and last_bear_candle and self.macro_bias != "BULLISH" and ( near_repulsor_top or cur_close >= (self.vah_price or cur_close) )):
+            elif smc["bear_sweep"] or (
+                z_score > 1.55
+                and last_bear_candle
+                and self.macro_bias != "BULLISH"
+                and (near_repulsor_top or cur_close >= (self.vah_price or cur_close))
+            ):
                 direction = -1
             else:
                 if abs(z_score) > 1.25:
@@ -893,7 +934,6 @@ class AutonomousQuantitativeBrain:
             conviction = min(conviction, 72.0)
             reason = "السياسة بلا ميزة إحصائية حديثة أو هيكل SMC صريح"
 
-        # فحص موقع السعر من المناطق المكتشفة (حماية من الدخول في وجه جدار سعري)
         if self.discovered_zones and direction != 0:
             cur_p = self.last_price if self.last_price is not None else cur_close
             nearest = min(self.discovered_zones, key=lambda z: abs(z["price"] - cur_p))
@@ -934,6 +974,7 @@ class AutonomousQuantitativeBrain:
             self.hist_entropy.append(self.compute_shannon_entropy(np.diff(closes[max(0, j - 61):j])))
 
     def _analyze(self, closed: List[Dict]):
+        times = np.array([c["time"] for c in closed], dtype=int)
         opens = np.array([c["open"] for c in closed], dtype=float)
         closes = np.array([c["close"] for c in closed], dtype=float)
         highs = np.array([c["high"] for c in closed], dtype=float)
@@ -954,7 +995,7 @@ class AutonomousQuantitativeBrain:
 
         self.discover_gravity_and_volume_profile(opens[-140:], closes[-140:], highs[-140:], lows[-140:])
 
-        self._decision = self.synthesize_optimal_policy(opens, highs, lows, closes)
+        self._decision = self.synthesize_optimal_policy(times, opens, highs, lows, closes)
         self.active_policy = self._decision["policy"]
         self.confidence = self._decision["score"]
 
@@ -1007,6 +1048,7 @@ class AutonomousQuantitativeBrain:
                 return
 
             self.equity = self.balance
+            self._update_drawdown(self.equity)
             if not self.bot_active:
                 self.block_reason = "الوكيل متوقف يدوياً"
                 return
@@ -1032,16 +1074,17 @@ class AutonomousQuantitativeBrain:
         return round(p, 2)
 
     def _compute_structural_stops(self, side: str, entry: float) -> tuple[float, float, float]:
-        """حساب الوقف والهدف الهيكلي مع حد أدنى صلب ($3.20) لمنع ضرب الذيول المبكر على الذهب."""
+        """حساب الوقف والهدف الهيكلي مع حماية حدود np.clip مهما ارتفع الـ ATR أو السبريد."""
         closed = list(self.candles)[:-1]
         recent = closed[-25:] if len(closed) >= 25 else closed
         atr = max(0.8, self.atr_value)
-        min_safe_sl = max(MIN_SL_DISTANCE, atr * 2.4 + self.spread * 2.0)
+        min_safe_sl = max(MIN_SL_DISTANCE, atr * 2.4 + self.spread * 1.8)
+        upper_sl_bound = max(MAX_SL_DISTANCE, min_safe_sl + 1.25)
 
         if side == "BUY":
             swing_low = min(c["low"] for c in recent) if recent else entry - min_safe_sl
             raw_sl = min(entry - min_safe_sl, swing_low - atr * 0.55)
-            sl_d = float(np.clip(entry - raw_sl, min_safe_sl, MAX_SL_DISTANCE))
+            sl_d = float(np.clip(entry - raw_sl, min_safe_sl, upper_sl_bound))
             tp_d = round(sl_d * TARGET_RR_RATIO, 2)
             above_zones = [z["price"] for z in self.discovered_zones if z["price"] > entry + sl_d * 1.6]
             if above_zones:
@@ -1053,7 +1096,7 @@ class AutonomousQuantitativeBrain:
         else:
             swing_high = max(c["high"] for c in recent) if recent else entry + min_safe_sl
             raw_sl = max(entry + min_safe_sl, swing_high + atr * 0.55)
-            sl_d = float(np.clip(raw_sl - entry, min_safe_sl, MAX_SL_DISTANCE))
+            sl_d = float(np.clip(raw_sl - entry, min_safe_sl, upper_sl_bound))
             tp_d = round(sl_d * TARGET_RR_RATIO, 2)
             below_zones = [z["price"] for z in self.discovered_zones if z["price"] < entry - sl_d * 1.6]
             if below_zones:
@@ -1076,7 +1119,6 @@ class AutonomousQuantitativeBrain:
         if self.lot_mode == "FIXED_001":
             lots = 0.01
         else:
-            # سقف مخاطرة صارم لا يتجاوز 0.35% من الرصيد ولا يتعدى 0.10 لوت
             risk_usd = self.balance * MAX_RISK_PCT_CAP
             lots = round(min(MAX_LOT_CAP, max(0.01, risk_usd / max(1.0, sl_d * 100.0))), 2)
 
@@ -1125,12 +1167,12 @@ class AutonomousQuantitativeBrain:
         floating = round(diff * pos["lots"] * 100.0, 2)
         pos["unrealized_pnl"] = round(floating + pos["realized"], 2)
         self.equity = round(self.balance + floating, 2)
+        self._update_drawdown(self.equity)
 
         r_multiple = diff / max(0.1, pos["initial_risk"])
         pos["r_multiple"] = round(r_multiple, 2)
         held = time.time() - pos["opened_ts"]
 
-        # منع خنق الصفقة الرابحة مبكراً: لا يتم التأمين إلا بعد وصول السعر إلى 1.35R (أو 1.50R للوت 0.01)
         can_partial = pos["lots"] >= 0.02
         be_trigger_r = 1.35 if can_partial else 1.50
 
@@ -1154,7 +1196,6 @@ class AutonomousQuantitativeBrain:
             self._save_runtime_key("open_position", pos)
             await self.tg.notify_secured(pos, note_msg)
 
-        # الوقف التتبعي يبدأ فقط بعد 1.85R وبمسافة مريحة تسمح ببلوغ الهدف الكامل
         if pos["be_secured"] and r_multiple >= 1.85:
             trail_dist = round(max(pos["initial_risk"] * 0.80, self.atr_value * 1.75), 2)
             if side == "BUY":
@@ -1198,12 +1239,7 @@ class AutonomousQuantitativeBrain:
         total_pnl = round(pnl_rest + pos["realized"], 2)
         self.balance = round(self.balance + pnl_rest, 2)
         self.equity = self.balance
-
-        if self.balance > self.peak_balance:
-            self.peak_balance = self.balance
-        dd_pct = round((self.peak_balance - self.balance) / max(1.0, self.peak_balance) * 100.0, 2)
-        if dd_pct > self.max_drawdown_pct:
-            self.max_drawdown_pct = dd_pct
+        self._update_drawdown(self.balance)
 
         r_result = round(total_pnl / max(pos["risk_usd"], 1e-6), 2)
         trade_date = today_utc_str()
@@ -1267,7 +1303,7 @@ class AutonomousQuantitativeBrain:
         await self.tg.notify_exit(record, r_result, self.balance, self.get_kpi_metrics())
 
     def _persist_trade_and_lesson(self, rec: Dict, policy_name: str):
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -1389,7 +1425,6 @@ class LiveGoldStream:
         return parse_swissquote(data, SQ_PROFILE)
 
     async def _quote_paxg_fallback(self):
-        """مصدر احتياطي فوري للسعر الحي في حال تأخر Swissquote."""
         try:
             r = await self._http().get(
                 BINANCE_VISION_URL,
@@ -1405,8 +1440,6 @@ class LiveGoldStream:
         return None
 
     async def _fetch_external_history(self) -> tuple[List[Dict], str]:
-        """جلب 350 شمعة تاريخية للذهب عبر Binance Vision أو Binance Main أو Kraken بدون مكتبة yfinance."""
-        # 1. المحاولة عبر Binance Vision (لا تحظر سيرفرات Render الأمريكية/الأوروبية)
         for url, label in ((BINANCE_VISION_URL, "BINANCE_VISION_PAXG"), (BINANCE_MAIN_URL, "BINANCE_PAXG")):
             try:
                 r = await self._http().get(
@@ -1429,7 +1462,6 @@ class LiveGoldStream:
             except Exception as e:
                 print(f"{label} history error:", repr(e))
 
-        # 2. المحاولة الاحتياطية عبر Kraken Public OHLC (PAXGUSD)
         try:
             r = await self._http().get(
                 KRAKEN_OHLC_URL,
@@ -1457,7 +1489,6 @@ class LiveGoldStream:
         return [], "NONE"
 
     async def _load_history(self, ref_price: float):
-        """جلب ومزامنة الشموع التاريخية مع معايرة الفارق السعري على سعر Swissquote الحي وحفظها في SQLite."""
         self.last_hist_try = time.time()
         self.hist_tries += 1
 
@@ -1467,7 +1498,6 @@ class LiveGoldStream:
 
         async with self.brain.lock:
             live = list(self.brain.candles)
-            # نأخذ الشموع الحية الحديثة فقط (آخر 15 دقيقة) كمرجع للمعايرة
             now_bucket = (int(time.time()) // TF_SEC) * TF_SEC
             recent_live = [c for c in live if now_bucket - c["time"] <= TF_SEC * 15]
             first_live_ts = recent_live[0]["time"] if recent_live else now_bucket
@@ -1483,7 +1513,6 @@ class LiveGoldStream:
             if len(clean) < 30:
                 return
 
-            # حساب إزاحة المعايرة (Auto-Anchor Offset) لتتطابق شموع PAXG مع سعر CFD الفوري لـ Swissquote
             off = anchor_price - clean[-1]["close"]
             if abs(off) > ref_price * 0.05:
                 off = 0.0
@@ -1506,12 +1535,18 @@ class LiveGoldStream:
 
             closes_arr = np.array([c["close"] for c in self.brain.candles], dtype=float)
             self.brain._warm_history(closes_arr)
+            if len(self.brain.candles) > MIN_CANDLES:
+                self.brain._analyze(list(self.brain.candles)[:-1])
             self.brain._analysis_ts = None
             self.hist_loaded = True
             self.brain.log_thought(
                 f"تم تحميل ومعايرة {len(shifted)} شمعة تاريخية عبر ({src_label}) وحفظها في SQLite بنجاح.",
                 "PERCEPTION",
             )
+
+        # بث اللقطة الكاملة فوراً لجميع المتصفحات المتصلة لرسم التاريخ الجديد دون الحاجة لتحديث الصفحة
+        if self.clients:
+            await self._broadcast(self.build_payload("INIT_SNAPSHOT", full=True))
 
     def _update_candle(self, price: float, bucket: int):
         candles = self.brain.candles
@@ -1603,8 +1638,10 @@ class LiveGoldStream:
             "bid": b.bid_price,
             "ask": b.ask_price,
             "spread": b.spread,
+            "max_spread": MAX_SPREAD,
             "balance": b.balance,
             "equity": b.equity,
+            "initial_balance": b.initial_balance,
             "kpis": b.get_kpi_metrics(),
             "telegram": {
                 "enabled": b.tg.enabled,
@@ -1643,8 +1680,12 @@ class LiveGoldStream:
         }
         if full:
             payload["candles"] = list(b.candles)
+            payload["ema_fast_series"] = b.ema_fast_series[-350:]
+            payload["ema_slow_series"] = b.ema_slow_series[-350:]
         else:
             payload["candle"] = b.candles[-1] if b.candles else None
+            payload["ema_fast_point"] = b.ema_fast_series[-1] if b.ema_fast_series else None
+            payload["ema_slow_point"] = b.ema_slow_series[-1] if b.ema_slow_series else None
         return payload
 
     async def _broadcast(self, payload: Dict):
@@ -1684,7 +1725,7 @@ async def lifespan(_: FastAPI):
             pass
 
 
-app = FastAPI(title="Autonomous XAU/USD Quantitative React Terminal v4", lifespan=lifespan)
+app = FastAPI(title="Autonomous XAU/USD Quantitative Cockpit v5", lifespan=lifespan)
 
 
 @app.websocket("/ws")
@@ -1734,7 +1775,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                 elif cmd == "TEST_TELEGRAM":
                     test_msg = (
-                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Quant Cortex v4</b>\n"
+                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Obsidian Cockpit v5</b>\n"
                         "━━━━━━━━━━━━━━━━━━\n"
                         f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.\n"
                         f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>\n"
@@ -1765,31 +1806,31 @@ async def websocket_endpoint(ws: WebSocket):
             stream_manager.clients.remove(ws)
 
 
+# ==============================================================================
+# 5. واجهة Obsidian & Liquid Gold Quantitative Cockpit (Apple VisionOS Design)
+# ==============================================================================
 HTML_UI = """<!DOCTYPE html>
 <html lang="ar" dir="rtl" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>XAU/USD — Quantitative Cortex React Terminal v4</title>
+  <title>XAU/USD — Obsidian & Liquid Gold Quantitative Cockpit v5</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-canvas: #06080D;
-      --bg-card: rgba(13, 17, 26, 0.88);
-      --border-glass: rgba(255, 255, 255, 0.08);
+      --bg-obsidian: #04060A;
+      --card-surface: rgba(11, 15, 24, 0.78);
+      --border-specular: rgba(255, 255, 255, 0.09);
     }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body {
-      background-color: var(--bg-canvas);
-      background-image:
-        radial-gradient(at 15% 0%, rgba(245, 158, 11, 0.07) 0px, transparent 45%),
-        radial-gradient(at 85% 5%, rgba(16, 185, 129, 0.05) 0px, transparent 45%);
-      color: #F1F5F9;
+      background-color: var(--bg-obsidian);
+      color: #F8FAFC;
       font-family: 'Cairo', sans-serif;
       margin: 0;
       overflow-x: hidden;
@@ -1800,26 +1841,33 @@ HTML_UI = """<!DOCTYPE html>
       direction: ltr;
       display: inline-block;
     }
-    .glass-card {
-      background: var(--bg-card);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border: 1px solid var(--border-glass);
-      border-radius: 16px;
-      box-shadow: 0 12px 34px -8px rgba(0, 0, 0, 0.55);
+    .vision-card {
+      background: linear-gradient(165deg, rgba(20, 26, 40, 0.82) 0%, rgba(9, 12, 20, 0.90) 100%);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid var(--border-specular);
+      border-top: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 20px;
+      box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.75), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
     }
-    .glass-pill {
-      background: rgba(255, 255, 255, 0.035);
-      border: 1px solid rgba(255, 255, 255, 0.075);
-      border-radius: 11px;
+    .vision-pill {
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.045) 0%, rgba(255, 255, 255, 0.015) 100%);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-top: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: 14px;
+    }
+    .gold-gradient-text {
+      background: linear-gradient(135deg, #FDE68A 0%, #F59E0B 55%, #D97706 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
     .no-scrollbar::-webkit-scrollbar { display: none; }
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-    @keyframes pulseGlow {
+    @keyframes pulseRing {
       0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.45; transform: scale(0.92); }
+      50% { opacity: 0.45; transform: scale(0.90); }
     }
-    .dot-live { animation: pulseGlow 2s infinite ease-in-out; }
+    .dot-live { animation: pulseRing 2s infinite ease-in-out; }
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.22); border-radius: 9999px; }
@@ -1842,10 +1890,98 @@ HTML_UI = """<!DOCTYPE html>
       return map[cat] || "bg-slate-700/40 text-slate-300 border-slate-600/40";
     };
 
-    function TradingChart({ candles, latestCandle, zones, openPos, poc, vah, val, showZones, showVP }) {
+    // مكون منحنى الرصيد المصغر (Mini SVG Equity Curve Sparkline)
+    function EquitySparkline({ initialBalance, currentEquity, tradeLog }) {
+      const points = useMemo(() => {
+        const logs = [...(tradeLog || [])].reverse();
+        let cur = Number(initialBalance || 100);
+        const vals = [cur];
+        logs.forEach(t => {
+          cur += Number(t.pnl || 0);
+          vals.push(cur);
+        });
+        if (currentEquity !== undefined && currentEquity !== null) {
+          vals.push(Number(currentEquity));
+        }
+        return vals;
+      }, [initialBalance, currentEquity, tradeLog]);
+
+      if (points.length < 2) return null;
+      const minV = Math.min(...points);
+      const maxV = Math.max(...points);
+      const span = Math.max(0.5, maxV - minV);
+      const w = 96, h = 28;
+      const coords = points.map((v, idx) => {
+        const x = (idx / (points.length - 1)) * w;
+        const y = h - 4 - ((v - minV) / span) * (h - 8);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      });
+      const isUp = points[points.length - 1] >= points[0];
+      const strokeColor = isUp ? "#10B981" : "#F43F5E";
+
+      return (
+        <svg width={w} height={h} className="overflow-visible shrink-0">
+          <polyline
+            fill="none"
+            stroke={strokeColor}
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            points={coords.join(" ")}
+          />
+        </svg>
+      );
+    }
+
+    // مكون عداد القناعة الدائري المتوهج (Radial Conviction Gauge)
+    function RadialConvictionGauge({ confidence, threshold = 86, macroBias }) {
+      const r = 34;
+      const c = 2 * Math.PI * r;
+      const pct = Math.min(100, Math.max(0, Number(confidence || 0)));
+      const offset = c - (pct / 100) * c;
+      const isReady = pct >= threshold;
+      const strokeColor = isReady ? "#10B981" : pct >= 70 ? "#F59E0B" : "#38BDF8";
+
+      return (
+        <div className="relative flex items-center justify-center w-24 h-24 shrink-0">
+          <svg className="w-24 h-24 -rotate-90" viewBox="0 0 84 84">
+            <circle cx="42" cy="42" r={r} stroke="rgba(255,255,255,0.07)" strokeWidth="6.5" fill="none" />
+            <circle
+              cx="42"
+              cy="42"
+              r={r}
+              stroke={strokeColor}
+              strokeWidth="6.5"
+              strokeDasharray={c}
+              strokeDashoffset={offset}
+              strokeLinecap="round"
+              fill="none"
+              style={{ transition: "stroke-dashoffset 0.45s ease, stroke 0.3s ease" }}
+            />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
+            <span className="mono text-base font-extrabold text-white">{pct.toFixed(1)}%</span>
+            <span className={`text-[9px] font-bold tracking-wider ${
+              macroBias === 'BULLISH' ? 'text-emerald-400' : macroBias === 'BEARISH' ? 'text-rose-400' : 'text-amber-300'
+            }`}>
+              {macroBias}
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // مكون شارت TradingView التفاعلي مع خطوط EMA 50 / EMA 150
+    function TradingChart({
+      candles, latestCandle, zones, openPos, poc, vah, val,
+      emaFastSeries, emaSlowSeries, emaFastPoint, emaSlowPoint,
+      showZones, showVP, showEMA
+    }) {
       const containerRef = useRef(null);
       const chartRef = useRef(null);
       const seriesRef = useRef(null);
+      const emaFastRef = useRef(null);
+      const emaSlowRef = useRef(null);
       const zoneLinesRef = useRef([]);
       const vpLinesRef = useRef([]);
       const posLinesRef = useRef([]);
@@ -1860,13 +1996,13 @@ HTML_UI = """<!DOCTYPE html>
             fontSize: 11,
           },
           grid: {
-            vertLines: { color: 'rgba(255, 255, 255, 0.03)' },
-            horzLines: { color: 'rgba(255, 255, 255, 0.03)' },
+            vertLines: { color: 'rgba(255, 255, 255, 0.025)' },
+            horzLines: { color: 'rgba(255, 255, 255, 0.025)' },
           },
           crosshair: {
             mode: LightweightCharts.CrosshairMode.Normal,
-            vertLine: { color: 'rgba(245, 158, 11, 0.35)', width: 1, style: 2 },
-            horzLine: { color: 'rgba(245, 158, 11, 0.35)', width: 1, style: 2 },
+            vertLine: { color: 'rgba(245, 158, 11, 0.40)', width: 1, style: 2 },
+            horzLine: { color: 'rgba(245, 158, 11, 0.40)', width: 1, style: 2 },
           },
           rightPriceScale: {
             borderColor: 'rgba(255, 255, 255, 0.08)',
@@ -1890,8 +2026,27 @@ HTML_UI = """<!DOCTYPE html>
           wickDownColor: '#F43F5E',
         });
 
+        const emaFastLine = chart.addLineSeries({
+          color: '#38BDF8',
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+
+        const emaSlowLine = chart.addLineSeries({
+          color: '#F59E0B',
+          lineWidth: 2,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+
         chartRef.current = chart;
         seriesRef.current = series;
+        emaFastRef.current = emaFastLine;
+        emaSlowRef.current = emaSlowLine;
 
         const ro = new ResizeObserver(entries => {
           if (!entries.length) return;
@@ -1920,6 +2075,27 @@ HTML_UI = """<!DOCTYPE html>
           seriesRef.current.update(latestCandle);
         }
       }, [latestCandle]);
+
+      useEffect(() => {
+        if (!emaFastRef.current || !emaSlowRef.current) return;
+        if (!showEMA) {
+          emaFastRef.current.setData([]);
+          emaSlowRef.current.setData([]);
+          return;
+        }
+        if (emaFastSeries && emaFastSeries.length > 0) {
+          emaFastRef.current.setData(emaFastSeries);
+        }
+        if (emaSlowSeries && emaSlowSeries.length > 0) {
+          emaSlowRef.current.setData(emaSlowSeries);
+        }
+      }, [emaFastSeries, emaSlowSeries, showEMA]);
+
+      useEffect(() => {
+        if (!showEMA || !emaFastRef.current || !emaSlowRef.current) return;
+        if (emaFastPoint) emaFastRef.current.update(emaFastPoint);
+        if (emaSlowPoint) emaSlowRef.current.update(emaSlowPoint);
+      }, [emaFastPoint, emaSlowPoint, showEMA]);
 
       useEffect(() => {
         if (!seriesRef.current) return;
@@ -2011,13 +2187,18 @@ HTML_UI = """<!DOCTYPE html>
         }));
       }, [openPos]);
 
-      return <div ref={containerRef} className="w-full h-[270px] sm:h-[360px] lg:h-[430px]" />;
+      return <div ref={containerRef} className="w-full h-[280px] sm:h-[370px] lg:h-[445px]" />;
     }
 
     function App() {
       const [connected, setConnected] = useState(false);
       const [snapshotCandles, setSnapshotCandles] = useState([]);
       const [latestCandle, setLatestCandle] = useState(null);
+      const [emaFastSeries, setEmaFastSeries] = useState([]);
+      const [emaSlowSeries, setEmaSlowSeries] = useState([]);
+      const [emaFastPoint, setEmaFastPoint] = useState(null);
+      const [emaSlowPoint, setEmaSlowPoint] = useState(null);
+
       const [state, setState] = useState({
         tf_min: 1,
         candle_rem_s: 60,
@@ -2029,8 +2210,10 @@ HTML_UI = """<!DOCTYPE html>
         bid: null,
         ask: null,
         spread: 0.25,
+        max_spread: 0.99,
         balance: 100,
         equity: 100,
+        initial_balance: 100,
         kpis: { win_rate: 0, total_trades: 0, wins: 0, losses: 0, profit_factor: 0, net_pnl: 0, expectancy: 0, max_drawdown_pct: 0 },
         telegram: { enabled: false, configured: false, masked_token: "", chat_id: "", last_status: "غير مرتبط", last_report_date: "" },
         cognition: {
@@ -2053,6 +2236,7 @@ HTML_UI = """<!DOCTYPE html>
 
       const [showZones, setShowZones] = useState(true);
       const [showVP, setShowVP] = useState(true);
+      const [showEMA, setShowEMA] = useState(true);
       const [desktopDockTab, setDesktopDockTab] = useState("POSITION");
       const [mobileNav, setMobileNav] = useState("CHART");
 
@@ -2090,9 +2274,13 @@ HTML_UI = """<!DOCTYPE html>
 
             if (data.type === "INIT_SNAPSHOT") {
               if (data.candles) setSnapshotCandles(data.candles);
+              if (data.ema_fast_series) setEmaFastSeries(data.ema_fast_series);
+              if (data.ema_slow_series) setEmaSlowSeries(data.ema_slow_series);
               setState(prev => ({ ...prev, ...data }));
             } else if (data.type === "TICK_UPDATE") {
               if (data.candle) setLatestCandle(data.candle);
+              if (data.ema_fast_point) setEmaFastPoint(data.ema_fast_point);
+              if (data.ema_slow_point) setEmaSlowPoint(data.ema_slow_point);
               setState(prev => ({ ...prev, ...data }));
             }
           };
@@ -2121,6 +2309,18 @@ HTML_UI = """<!DOCTYPE html>
       };
 
       const { cognition: cog, kpis, open_position: pos, session, telegram: tg } = state;
+      const spreadLimit = state.max_spread || 0.99;
+
+      // إضاءة محيطية ديناميكية حسب حالة السوق (Ambient Aura)
+      const ambientAura = useMemo(() => {
+        if (cog.macro_bias === "BULLISH") {
+          return "radial-gradient(at 15% 0%, rgba(16, 185, 129, 0.10) 0px, transparent 50%), radial-gradient(at 85% 5%, rgba(245, 158, 11, 0.06) 0px, transparent 45%)";
+        }
+        if (cog.macro_bias === "BEARISH") {
+          return "radial-gradient(at 15% 0%, rgba(244, 63, 94, 0.10) 0px, transparent 50%), radial-gradient(at 85% 5%, rgba(245, 158, 11, 0.06) 0px, transparent 45%)";
+        }
+        return "radial-gradient(at 15% 0%, rgba(245, 158, 11, 0.09) 0px, transparent 50%), radial-gradient(at 85% 5%, rgba(56, 189, 248, 0.06) 0px, transparent 45%)";
+      }, [cog.macro_bias]);
 
       const posProgress = useMemo(() => {
         if (!pos || !state.price) return 50;
@@ -2140,42 +2340,42 @@ HTML_UI = """<!DOCTYPE html>
         if (!pos) {
           return (
             <div className="py-5 text-center text-xs text-slate-400">
-              لا توجد صفقة نشطة حالياً — الوكيل يفحص توافق الهيكل الكلي (EMA 50/150) مع هياكل السيولة (SMC).
+              لا توجد صفقة نشطة حالياً — يفحص الوكيل توافق الهيكل الكلي (EMA 50/150) مع سحب السيولة (SMC).
             </div>
           );
         }
         return (
           <div className="space-y-3">
             <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 text-xs">
-              <div className="glass-pill p-2.5">
+              <div className="vision-pill p-2.5">
                 <span className="text-[10px] text-slate-400 block">الاتجاه / اللوت</span>
                 <span className={`font-extrabold mono text-sm ${pos.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>
                   {pos.side} ({pos.lots}L)
                 </span>
               </div>
-              <div className="glass-pill p-2.5">
+              <div className="vision-pill p-2.5">
                 <span className="text-[10px] text-slate-400 block">سعر الدخول</span>
                 <span className="font-bold mono text-sm text-sky-300">${pos.entry_price.toFixed(2)}</span>
               </div>
-              <div className="glass-pill p-2.5">
+              <div className="vision-pill p-2.5">
                 <span className="text-[10px] text-slate-400 block">السعر الحالي</span>
                 <span className="font-bold mono text-sm text-white">${pos.current_price.toFixed(2)}</span>
               </div>
-              <div className="glass-pill p-2.5">
+              <div className="vision-pill p-2.5">
                 <span className="text-[10px] text-slate-400 block">الوقف الآمن (SL)</span>
                 <span className="font-bold mono text-sm text-rose-400">${pos.sl.toFixed(2)}</span>
               </div>
-              <div className="glass-pill p-2.5">
+              <div className="vision-pill p-2.5">
                 <span className="text-[10px] text-slate-400 block">الهدف (TP 2.3R)</span>
                 <span className="font-bold mono text-sm text-emerald-400">${pos.tp.toFixed(2)}</span>
               </div>
-              <div className="glass-pill p-2.5">
+              <div className="vision-pill p-2.5">
                 <span className="text-[10px] text-slate-400 block">العائد (R)</span>
                 <span className={`font-bold mono text-sm ${(pos.r_multiple || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                   {(pos.r_multiple || 0) >= 0 ? '+' : ''}{Number(pos.r_multiple || 0).toFixed(2)}R
                 </span>
               </div>
-              <div className="glass-pill p-2.5 col-span-2 sm:col-span-1">
+              <div className="vision-pill p-2.5 col-span-2 sm:col-span-1">
                 <span className="text-[10px] text-slate-400 block">الربح اللحظي</span>
                 <span className={`font-extrabold mono text-sm ${pos.unrealized_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                   {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
@@ -2183,11 +2383,11 @@ HTML_UI = """<!DOCTYPE html>
               </div>
             </div>
 
-            <div className="glass-pill p-3">
+            <div className="vision-pill p-3">
               <div className="flex items-center justify-between text-[11px] mb-1.5">
                 <span className="text-rose-400 mono font-semibold">SL: ${pos.sl.toFixed(2)}</span>
                 <span className="text-slate-300 text-[11px]">
-                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+ بعد 1.35R)' : '⏳ تحت المراقبة الحية (تأمين عند 1.35R)'}
+                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+ مفعل)' : '⏳ تحت المراقبة الحية (تأمين عند 1.35R)'}
                 </span>
                 <span className="text-emerald-400 mono font-semibold">TP: ${pos.tp.toFixed(2)}</span>
               </div>
@@ -2210,7 +2410,7 @@ HTML_UI = """<!DOCTYPE html>
           <div>
             <div className="space-y-2 md:hidden max-h-[380px] overflow-y-auto pr-1">
               {state.trade_log.map((t) => (
-                <div key={t.id} className="glass-pill p-3 space-y-1.5 text-xs">
+                <div key={t.id} className="vision-pill p-3 space-y-1.5 text-xs">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <span className={`px-2 py-0.5 rounded font-bold mono ${
@@ -2270,7 +2470,7 @@ HTML_UI = """<!DOCTYPE html>
 
       const renderTelegramSettings = () => (
         <div className="space-y-3 text-xs">
-          <div className="flex flex-wrap items-center justify-between gap-2 glass-pill p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 vision-pill p-3">
             <div>
               <div className="font-bold text-slate-200 flex items-center gap-2">
                 <span>حالة الربط بتلغرام:</span>
@@ -2346,64 +2546,65 @@ HTML_UI = """<!DOCTYPE html>
         </div>
       );
 
+      // لوحة الوعي الرياضي بتصميم Obsidian & Liquid Gold مع العداد الدائري
       const renderCortexPanel = () => (
-        <div className="glass-card p-3.5 sm:p-4 flex flex-col gap-3.5">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-xs font-extrabold text-amber-400 tracking-wide">القشرة الكمية والهيكلية (Cortex v4)</h2>
-              <p className="text-[11px] text-slate-400 mt-0.5">{cog.block_reason}</p>
+        <div className="vision-card p-4 flex flex-col gap-3.5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+                <h2 className="text-xs font-extrabold gold-gradient-text tracking-wide">القشرة الكمية والهيكلية (Cortex v5)</h2>
+              </div>
+              <p className="text-[11px] text-slate-300 mt-1.5 leading-relaxed">{cog.block_reason}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] mono">
+                <span className="px-2 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
+                  EMA50: {cog.ema_fast ? `$${cog.ema_fast}` : '--'}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                  EMA150: {cog.ema_slow ? `$${cog.ema_slow}` : '--'}
+                </span>
+              </div>
             </div>
-            <div className="glass-pill px-3 py-1 text-right">
-              <span className="text-[10px] text-slate-400 block">قناعة الدخول (الحد 86%)</span>
-              <span className="text-sm font-extrabold text-amber-300 mono">{cog.confidence}%</span>
-            </div>
-          </div>
-
-          <div className="w-full h-2 bg-slate-800/90 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-gradient-to-l from-emerald-400 via-amber-400 to-sky-400 transition-all duration-300"
-              style={{ width: `${Math.min(100, cog.confidence)}%` }}
-            />
+            <RadialConvictionGauge confidence={cog.confidence} threshold={86} macroBias={cog.macro_bias} />
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-xs">
-            <div className="glass-pill p-2.5">
-              <div className="text-[10px] text-slate-400">الاتجاه الكلي (Macro Bias)</div>
-              <div className={`font-extrabold mt-0.5 mono text-xs ${
-                cog.macro_bias === 'BULLISH' ? 'text-emerald-400' : cog.macro_bias === 'BEARISH' ? 'text-rose-400' : 'text-amber-300'
-              }`}>
-                {cog.macro_bias} {cog.ema_fast ? `(EMA: $${cog.ema_fast})` : ''}
-              </div>
-            </div>
-            <div className="glass-pill p-2.5">
-              <div className="text-[10px] text-slate-400">السياسة النشطة</div>
-              <div className="font-bold text-sky-400 mt-0.5 mono text-[11px] truncate">{cog.policy}</div>
-            </div>
-            <div className="glass-pill p-2.5">
+            <div className="vision-pill p-2.5">
               <div className="flex items-center justify-between text-[10px] text-slate-400">
                 <span>هيرست (Hurst)</span>
                 <span className="mono text-emerald-400">{cog.hurst_rank}%</span>
               </div>
               <div className="font-bold text-emerald-300 mt-0.5 mono text-sm">{Number(cog.hurst).toFixed(3)}</div>
+              <div className="w-full h-1 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
+                <div className="h-full bg-emerald-400" style={{ width: `${Math.min(100, cog.hurst_rank)}%` }} />
+              </div>
             </div>
-            <div className="glass-pill p-2.5">
+
+            <div className="vision-pill p-2.5">
               <div className="flex items-center justify-between text-[10px] text-slate-400">
                 <span>إنتروبيا شانون</span>
                 <span className="mono text-amber-400">{cog.entropy_rank}%</span>
               </div>
               <div className="font-bold text-amber-300 mt-0.5 mono text-sm">{Number(cog.entropy).toFixed(3)}</div>
+              <div className="w-full h-1 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
+                <div className="h-full bg-amber-400" style={{ width: `${Math.min(100, cog.entropy_rank)}%` }} />
+              </div>
             </div>
-            <div className="glass-pill p-2.5">
-              <div className="text-[10px] text-slate-400">المدى الحقيقي (ATR)</div>
-              <div className="font-bold text-purple-300 mt-0.5 mono text-sm">${Number(cog.atr || 0).toFixed(2)}</div>
+
+            <div className="vision-pill p-2.5">
+              <div className="text-[10px] text-slate-400">السياسة النشطة</div>
+              <div className="font-bold text-sky-400 mt-0.5 mono text-[11px] truncate">{cog.policy}</div>
             </div>
-            <div className="glass-pill p-2.5">
-              <div className="text-[10px] text-slate-400">الانحراف (Z-Score)</div>
-              <div className="font-bold text-slate-200 mt-0.5 mono text-sm">{Number(cog.z_score || 0).toFixed(2)}σ</div>
+
+            <div className="vision-pill p-2.5">
+              <div className="text-[10px] text-slate-400">المدى والانحراف</div>
+              <div className="font-bold text-purple-300 mt-0.5 mono text-xs">
+                ATR ${Number(cog.atr || 0).toFixed(2)} | {Number(cog.z_score || 0).toFixed(2)}σ
+              </div>
             </div>
           </div>
 
-          <div className="glass-pill p-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div className="vision-pill p-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px]">
             <span className="text-slate-400 font-semibold">Volume Profile:</span>
             <div className="flex items-center gap-2.5 mono">
               <span className="text-slate-300">VAL: <b>${cog.val ? cog.val.toFixed(2) : '--'}</b></span>
@@ -2416,7 +2617,7 @@ HTML_UI = """<!DOCTYPE html>
             <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">مناطق الشذوذ والجاذبية السعرية (KDE):</div>
             <div className="grid grid-cols-2 gap-1.5 text-xs">
               {state.discovered_zones.map((z, idx) => (
-                <div key={idx} className="glass-pill px-2.5 py-1.5 flex items-center justify-between">
+                <div key={idx} className="vision-pill px-2.5 py-1.5 flex items-center justify-between">
                   <span className={`mono font-bold ${z.type === 'REPULSOR_ANOMALY' ? 'text-amber-300' : 'text-sky-300'}`}>
                     ${z.price.toFixed(2)}
                   </span>
@@ -2429,10 +2630,10 @@ HTML_UI = """<!DOCTYPE html>
           </div>
 
           <div className="pt-2 border-t border-white/[0.06]">
-            <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">أوزان التعلم المعزز:</div>
+            <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">أوزان التعلم المعزز (Reinforcement Weights):</div>
             <div className="grid grid-cols-3 gap-1.5 text-[11px] mono">
               {Object.entries(cog.weights || {}).map(([k, v]) => (
-                <div key={k} className="glass-pill px-2 py-1 text-center">
+                <div key={k} className="vision-pill px-2 py-1 text-center">
                   <span className="text-slate-400 block text-[9px]">{k.split('_')[0]}</span>
                   <span className="text-amber-300 font-bold">{v}x</span>
                 </div>
@@ -2443,7 +2644,7 @@ HTML_UI = """<!DOCTYPE html>
       );
 
       const renderNeuralStream = () => (
-        <div className="glass-card p-3.5 sm:p-4 flex-1 flex flex-col min-h-[260px]">
+        <div className="vision-card p-4 flex-1 flex flex-col min-h-[260px]">
           <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-white/[0.06]">
             <h3 className="text-xs font-extrabold text-slate-200">مجرى التفكير والاستنتاج الحي (Neural Stream)</h3>
             <span className="text-[10px] text-emerald-400 mono">LIVE</span>
@@ -2453,7 +2654,7 @@ HTML_UI = """<!DOCTYPE html>
               <div className="text-slate-500 text-center py-8">بانتظار تدفق البيانات لتحليل السوق...</div>
             ) : (
               state.thoughts.map((th, i) => (
-                <div key={i} className="glass-pill p-2.5 transition hover:border-white/15">
+                <div key={i} className="vision-pill p-2.5 transition hover:border-white/20">
                   <div className="flex items-center justify-between text-[10px] mb-1">
                     <span className={`px-2 py-0.5 rounded border font-semibold mono ${categoryBadge(th.category)}`}>
                       {th.category}
@@ -2469,232 +2670,176 @@ HTML_UI = """<!DOCTYPE html>
       );
 
       return (
-        <div className="min-h-screen flex flex-col p-2.5 sm:p-3.5 lg:p-4 pb-20 lg:pb-4 gap-3 max-w-[1920px] mx-auto select-none">
-          <header className="glass-card p-3 flex flex-col gap-2.5">
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <div className="flex items-center gap-2.5">
-                <div className="relative flex items-center justify-center w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-amber-500/10 border border-amber-500/25 shrink-0">
-                  <span className={`w-2.5 h-2.5 rounded-full ${connected ? 'bg-emerald-400 dot-live' : 'bg-rose-500'}`}></span>
-                </div>
-                <div>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="font-extrabold text-base sm:text-lg tracking-tight text-white mono">XAU/USD</span>
-                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/25">
-                      QUANT v4 PRO
-                    </span>
-                    <span className="hidden sm:inline-block text-[10px] px-2 py-0.5 rounded-full bg-white/5 text-slate-300 border border-white/10">
-                      {session?.label}
-                    </span>
+        <div style={{ backgroundImage: ambientAura }} className="min-h-screen transition-all duration-700">
+          <div className="min-h-screen flex flex-col p-2.5 sm:p-3.5 lg:p-4 pb-24 lg:pb-4 gap-3.5 max-w-[1920px] mx-auto select-none">
+
+            {/* 1. قمرة القيادة العلوية (Obsidian & Liquid Gold Header) */}
+            <header className="vision-card p-3 sm:p-3.5 flex flex-col gap-2.5">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <div className="relative flex items-center justify-center w-9 h-9 rounded-2xl bg-amber-500/10 border border-amber-500/30 shrink-0 shadow-inner">
+                    <span className={`w-2.5 h-2.5 rounded-full ${connected ? 'bg-emerald-400 dot-live' : 'bg-rose-500'}`}></span>
                   </div>
-                  <p className="text-[10px] text-slate-400 mono truncate max-w-[190px] sm:max-w-none">{state.feed_source}</p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2.5">
-                <div className="text-left sm:text-right">
-                  <div className={`text-xl sm:text-2xl font-extrabold transition-colors duration-200 mono ${priceFlash}`}>
-                    {state.price ? `$${Number(state.price).toFixed(2)}` : '--.--'}
-                  </div>
-                  <div className="text-[10px] text-slate-400 mono">
-                    Spd: <b className={state.spread > 0.55 ? 'text-rose-400' : 'text-emerald-300'}>${Number(state.spread).toFixed(2)}</b>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-1.5">
-                  <button
-                    onClick={() => sendCommand('RELOAD_HISTORY')}
-                    title="إعادة مزامنة الشموع التاريخية"
-                    className="px-2 py-1.5 rounded-xl text-[11px] font-semibold bg-white/5 hover:bg-white/10 text-amber-300 border border-white/10 transition"
-                  >
-                    🔄 التاريخ
-                  </button>
-                  <button
-                    onClick={() => sendCommand('TOGGLE_LOT_MODE')}
-                    className="px-2.5 py-1.5 rounded-xl text-[11px] font-semibold bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition"
-                  >
-                    {state.lot_mode === 'FIXED_001' ? '0.01L' : '0.35%Risk'}
-                  </button>
-                  <button
-                    onClick={() => sendCommand('TOGGLE_BOT')}
-                    className={`px-2.5 sm:px-3 py-1.5 rounded-xl text-[11px] font-bold transition border ${
-                      state.bot_active
-                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                        : 'bg-slate-800/80 text-slate-300 border-slate-700'
-                    }`}
-                  >
-                    {state.bot_active ? 'نشط' : 'متوقف'}
-                  </button>
-                  {pos && (
-                    <button
-                      onClick={() => sendCommand('PANIC_CLOSE')}
-                      className="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40"
-                    >
-                      إغلاق!
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1 border-t border-white/[0.05]">
-              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
-                <div className="text-[9px] text-slate-400">الرصيد (Balance)</div>
-                <div className="text-xs sm:text-sm font-bold text-slate-100 mono">
-                  ${Number(state.balance).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                </div>
-              </div>
-              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
-                <div className="text-[9px] text-slate-400">الملكية (Equity)</div>
-                <div className={`text-xs sm:text-sm font-bold mono ${state.equity >= state.balance ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  ${Number(state.equity).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                </div>
-              </div>
-              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[100px]">
-                <div className="text-[9px] text-slate-400">نسبة النجاح</div>
-                <div className="text-xs sm:text-sm font-bold text-amber-400 mono">
-                  {kpis.win_rate}% <span className="text-[10px] text-slate-400">({kpis.wins}W/{kpis.losses}L)</span>
-                </div>
-              </div>
-              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[85px]">
-                <div className="text-[9px] text-slate-400">معامل الربح</div>
-                <div className="text-xs sm:text-sm font-bold text-sky-400 mono">
-                  {kpis.profit_factor === null ? '∞' : Number(kpis.profit_factor).toFixed(2)}
-                </div>
-              </div>
-              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[85px]">
-                <div className="text-[9px] text-slate-400">أقصى سحب</div>
-                <div className="text-xs sm:text-sm font-bold text-rose-400 mono">
-                  {Number(kpis.max_drawdown_pct).toFixed(2)}%
-                </div>
-              </div>
-              <div className="glass-pill px-2.5 py-1 shrink-0 min-w-[105px]">
-                <div className="text-[9px] text-slate-400">إشعارات تلغرام</div>
-                <div className={`text-xs font-bold ${tg.configured ? 'text-emerald-400' : 'text-slate-400'}`}>
-                  {tg.configured ? '✈️ متصل' : 'غير متصل'}
-                </div>
-              </div>
-            </div>
-          </header>
-
-          <div className="hidden lg:grid lg:grid-cols-12 gap-3.5 flex-1">
-            <div className="lg:col-span-8 flex flex-col gap-3.5">
-              <div className="glass-card p-3.5 flex-1 flex flex-col">
-                <div className="flex items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.06]">
-                  <div className="flex items-center gap-2.5">
-                    <span className="text-xs font-bold text-slate-200">شارت الهيكل الكمي والسيولة (XAU/USD {state.tf_min}m)</span>
-                    <span className="glass-pill px-2 py-0.5 text-[11px] mono text-amber-300">
-                      إغلاق الشمعة: {formatCountdown(state.candle_rem_s || 0)}
-                    </span>
-                    {cog.smc_event !== "NONE" && (
-                      <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 mono">
-                        {cog.smc_event}
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-black text-base sm:text-lg tracking-tight gold-gradient-text mono">XAU/USD</span>
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                        OBSIDIAN v5
                       </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2 text-[11px]">
-                    <button
-                      onClick={() => setShowZones(!showZones)}
-                      className={`px-2.5 py-1 rounded-lg border transition ${
-                        showZones ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/5'
-                      }`}
-                    >
-                      مناطق الشذوذ (KDE)
-                    </button>
-                    <button
-                      onClick={() => setShowVP(!showVP)}
-                      className={`px-2.5 py-1 rounded-lg border transition ${
-                        showVP ? 'bg-purple-500/15 text-purple-300 border-purple-500/30' : 'bg-white/5 text-slate-400 border-white/5'
-                      }`}
-                    >
-                      بروفيل الحجم (POC/VA)
-                    </button>
-                  </div>
-                </div>
-                <TradingChart
-                  candles={snapshotCandles}
-                  latestCandle={latestCandle}
-                  zones={state.discovered_zones}
-                  openPos={pos}
-                  poc={cog.poc}
-                  vah={cog.vah}
-                  val={cog.val}
-                  showZones={showZones}
-                  showVP={showVP}
-                />
-              </div>
-
-              <div className="glass-card p-4">
-                <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-white/[0.06]">
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      onClick={() => setDesktopDockTab("POSITION")}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
-                        desktopDockTab === "POSITION" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      الصفقة النشطة {pos ? `(#${pos.id})` : ''}
-                    </button>
-                    <button
-                      onClick={() => setDesktopDockTab("HISTORY")}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
-                        desktopDockTab === "HISTORY" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      سجل الصفقات ({state.trade_log.length})
-                    </button>
-                    <button
-                      onClick={() => setDesktopDockTab("TELEGRAM")}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
-                        desktopDockTab === "TELEGRAM" ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30' : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      ✈️ إشعارات وتقارير تلغرام
-                    </button>
-                  </div>
-                </div>
-
-                {desktopDockTab === "POSITION" && renderActivePosition()}
-                {desktopDockTab === "HISTORY" && renderTradeHistory()}
-                {desktopDockTab === "TELEGRAM" && renderTelegramSettings()}
-              </div>
-            </div>
-
-            <div className="lg:col-span-4 flex flex-col gap-3.5">
-              {renderCortexPanel()}
-              {renderNeuralStream()}
-            </div>
-          </div>
-
-          <div className="flex lg:hidden flex-col gap-3 flex-1">
-            {mobileNav === "CHART" && (
-              <>
-                <div className="glass-card p-3 flex flex-col">
-                  <div className="flex items-center justify-between gap-1.5 pb-2 mb-1.5 border-b border-white/[0.06]">
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-xs font-bold text-slate-200">الشارت الحي ({state.tf_min}m)</span>
-                      <span className="glass-pill px-2 py-0.5 text-[10px] mono text-amber-300">
-                        {formatCountdown(state.candle_rem_s || 0)}
+                      <span className="hidden sm:inline-block text-[10px] px-2.5 py-0.5 rounded-full bg-white/5 text-slate-300 border border-white/10">
+                        {session?.label}
                       </span>
                     </div>
-                    <div className="flex items-center gap-1 text-[10px]">
+                    <p className="text-[10px] text-slate-400 mono truncate max-w-[195px] sm:max-w-none">{state.feed_source}</p>
+                  </div>
+                </div>
+
+                {/* السعر اللحظي والسبريد وأزرار التحكم */}
+                <div className="flex items-center gap-3">
+                  <div className="text-left sm:text-right">
+                    <div className={`text-xl sm:text-2xl font-black transition-colors duration-200 mono ${priceFlash}`}>
+                      {state.price ? `$${Number(state.price).toFixed(2)}` : '--.--'}
+                    </div>
+                    <div className="text-[10px] text-slate-400 mono">
+                      Spd: <b className={state.spread > spreadLimit ? 'text-rose-400' : 'text-emerald-300'}>${Number(state.spread).toFixed(2)}</b>
+                      <span className="text-slate-500"> / {spreadLimit}$</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => sendCommand('RELOAD_HISTORY')}
+                      title="إعادة مزامنة الشموع التاريخية فوراً"
+                      className="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-white/5 hover:bg-white/10 text-amber-300 border border-white/10 transition"
+                    >
+                      🔄 التاريخ
+                    </button>
+                    <button
+                      onClick={() => sendCommand('TOGGLE_LOT_MODE')}
+                      className="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition"
+                    >
+                      {state.lot_mode === 'FIXED_001' ? '0.01L' : '0.35%Risk'}
+                    </button>
+                    <button
+                      onClick={() => sendCommand('TOGGLE_BOT')}
+                      className={`px-3 py-1.5 rounded-xl text-[11px] font-bold transition border ${
+                        state.bot_active
+                          ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                          : 'bg-slate-800/80 text-slate-300 border-slate-700'
+                      }`}
+                    >
+                      {state.bot_active ? 'نشط' : 'متوقف'}
+                    </button>
+                    {pos && (
+                      <button
+                        onClick={() => sendCommand('PANIC_CLOSE')}
+                        className="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                      >
+                        إغلاق!
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* شريط المؤشرات المالية مع منحنى الرصيد المصغر (Sparkline) */}
+              <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1.5 border-t border-white/[0.06]">
+                <div className="vision-pill px-3 py-1.5 shrink-0 flex items-center gap-3 min-w-[175px]">
+                  <div>
+                    <div className="text-[9px] text-slate-400">الرصيد والملكية (Equity)</div>
+                    <div className={`text-xs sm:text-sm font-extrabold mono ${state.equity >= state.balance ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      ${Number(state.equity).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                    </div>
+                  </div>
+                  <EquitySparkline
+                    initialBalance={state.initial_balance}
+                    currentEquity={state.equity}
+                    tradeLog={state.trade_log}
+                  />
+                </div>
+
+                <div className="vision-pill px-2.5 py-1.5 shrink-0 min-w-[95px]">
+                  <div className="text-[9px] text-slate-400">صافي الربح</div>
+                  <div className={`text-xs sm:text-sm font-bold mono ${kpis.net_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {kpis.net_pnl >= 0 ? '+' : ''}${Number(kpis.net_pnl).toFixed(2)}
+                  </div>
+                </div>
+
+                <div className="vision-pill px-2.5 py-1.5 shrink-0 min-w-[105px]">
+                  <div className="text-[9px] text-slate-400">نسبة النجاح</div>
+                  <div className="text-xs sm:text-sm font-bold text-amber-400 mono">
+                    {kpis.win_rate}% <span className="text-[10px] text-slate-400">({kpis.wins}W/{kpis.losses}L)</span>
+                  </div>
+                </div>
+
+                <div className="vision-pill px-2.5 py-1.5 shrink-0 min-w-[85px]">
+                  <div className="text-[9px] text-slate-400">معامل الربح</div>
+                  <div className="text-xs sm:text-sm font-bold text-sky-400 mono">
+                    {kpis.profit_factor === null ? '∞' : Number(kpis.profit_factor).toFixed(2)}
+                  </div>
+                </div>
+
+                <div className="vision-pill px-2.5 py-1.5 shrink-0 min-w-[85px]">
+                  <div className="text-[9px] text-slate-400">أقصى سحب (DD)</div>
+                  <div className="text-xs sm:text-sm font-bold text-rose-400 mono">
+                    {Number(kpis.max_drawdown_pct).toFixed(2)}%
+                  </div>
+                </div>
+
+                <div className="vision-pill px-2.5 py-1.5 shrink-0 min-w-[100px]">
+                  <div className="text-[9px] text-slate-400">التلغرام</div>
+                  <div className={`text-xs font-bold ${tg.configured ? 'text-emerald-400' : 'text-slate-400'}`}>
+                    {tg.configured ? '✈️ متصل' : 'غير متصل'}
+                  </div>
+                </div>
+              </div>
+            </header>
+
+            {/* 2. مساحة عمل سطح المكتب (Desktop 12-Col Bento Grid) */}
+            <div className="hidden lg:grid lg:grid-cols-12 gap-3.5 flex-1">
+              <div className="lg:col-span-8 flex flex-col gap-3.5">
+                <div className="vision-card p-3.5 flex-1 flex flex-col relative">
+                  <div className="flex items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.06]">
+                    <div className="flex items-center gap-2.5">
+                      <span className="text-xs font-bold text-slate-200">الشارت الهيكلي والكمي (XAU/USD {state.tf_min}m)</span>
+                      <span className="vision-pill px-2.5 py-0.5 text-[11px] mono text-amber-300 font-semibold">
+                        ⏱ {formatCountdown(state.candle_rem_s || 0)}
+                      </span>
+                      {cog.smc_event !== "NONE" && (
+                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 mono">
+                          {cog.smc_event}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-[11px]">
+                      <button
+                        onClick={() => setShowEMA(!showEMA)}
+                        className={`px-2.5 py-1 rounded-lg border transition ${
+                          showEMA ? 'bg-sky-500/15 text-sky-300 border-sky-500/30' : 'bg-white/5 text-slate-400 border-white/5'
+                        }`}
+                      >
+                        EMA 50/150
+                      </button>
                       <button
                         onClick={() => setShowZones(!showZones)}
-                        className={`px-2 py-0.5 rounded border ${
+                        className={`px-2.5 py-1 rounded-lg border transition ${
                           showZones ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/5'
                         }`}
                       >
-                        KDE
+                        KDE Zones
                       </button>
                       <button
                         onClick={() => setShowVP(!showVP)}
-                        className={`px-2 py-0.5 rounded border ${
+                        className={`px-2.5 py-1 rounded-lg border transition ${
                           showVP ? 'bg-purple-500/15 text-purple-300 border-purple-500/30' : 'bg-white/5 text-slate-400 border-white/5'
                         }`}
                       >
-                        POC
+                        POC / VA
                       </button>
                     </div>
                   </div>
+
                   <TradingChart
                     candles={snapshotCandles}
                     latestCandle={latestCandle}
@@ -2703,84 +2848,193 @@ HTML_UI = """<!DOCTYPE html>
                     poc={cog.poc}
                     vah={cog.vah}
                     val={cog.val}
+                    emaFastSeries={emaFastSeries}
+                    emaSlowSeries={emaSlowSeries}
+                    emaFastPoint={emaFastPoint}
+                    emaSlowPoint={emaSlowPoint}
                     showZones={showZones}
                     showVP={showVP}
+                    showEMA={showEMA}
                   />
                 </div>
 
-                <div className="glass-card p-3.5">
-                  <div className="flex items-center justify-between mb-2 pb-2 border-b border-white/[0.06]">
-                    <span className="text-xs font-bold text-amber-400">الصفقة النشطة وحالة القرار</span>
-                    <span className="text-[11px] font-bold mono text-amber-300">{cog.confidence}% قناعة</span>
+                <div className="vision-card p-4">
+                  <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-white/[0.06]">
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => setDesktopDockTab("POSITION")}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                          desktopDockTab === "POSITION" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        الصفقة النشطة {pos ? `(#${pos.id})` : ''}
+                      </button>
+                      <button
+                        onClick={() => setDesktopDockTab("HISTORY")}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                          desktopDockTab === "HISTORY" ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        سجل الصفقات ({state.trade_log.length})
+                      </button>
+                      <button
+                        onClick={() => setDesktopDockTab("TELEGRAM")}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                          desktopDockTab === "TELEGRAM" ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30' : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        ✈️ إشعارات وتقارير تلغرام
+                      </button>
+                    </div>
                   </div>
-                  <p className="text-[11px] text-slate-300 mb-2.5">{cog.block_reason}</p>
-                  {renderActivePosition()}
+
+                  {desktopDockTab === "POSITION" && renderActivePosition()}
+                  {desktopDockTab === "HISTORY" && renderTradeHistory()}
+                  {desktopDockTab === "TELEGRAM" && renderTelegramSettings()}
                 </div>
-              </>
-            )}
-
-            {mobileNav === "CORTEX" && renderCortexPanel()}
-
-            {mobileNav === "LOGS" && (
-              <>
-                <div className="glass-card p-3.5">
-                  <h3 className="text-xs font-extrabold text-slate-200 pb-2 mb-2.5 border-b border-white/[0.06]">
-                    سجل الصفقات ({state.trade_log.length})
-                  </h3>
-                  {renderTradeHistory()}
-                </div>
-                {renderNeuralStream()}
-              </>
-            )}
-
-            {mobileNav === "TELEGRAM" && (
-              <div className="glass-card p-3.5">
-                <h3 className="text-xs font-extrabold text-sky-400 pb-2 mb-3 border-b border-white/[0.06]">
-                  ✈️ إعدادات ربط تلغرام والتقرير اليومي
-                </h3>
-                {renderTelegramSettings()}
               </div>
-            )}
-          </div>
 
-          <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#090D15]/95 backdrop-blur-xl border-t border-white/10 px-2 py-1.5 flex items-center justify-around">
-            <button
-              onClick={() => setMobileNav("CHART")}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
-                mobileNav === "CHART" ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400'
-              }`}
-            >
-              <span>📈</span>
-              <span>الشارت والصفقة</span>
-            </button>
-            <button
-              onClick={() => setMobileNav("CORTEX")}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
-                mobileNav === "CORTEX" ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400'
-              }`}
-            >
-              <span>🧠</span>
-              <span>الوعي الكمي</span>
-            </button>
-            <button
-              onClick={() => setMobileNav("LOGS")}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
-                mobileNav === "LOGS" ? 'text-amber-400 bg-amber-500/10' : 'text-slate-400'
-              }`}
-            >
-              <span>📜</span>
-              <span>السجل والأفكار</span>
-            </button>
-            <button
-              onClick={() => setMobileNav("TELEGRAM")}
-              className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[11px] font-bold transition ${
-                mobileNav === "TELEGRAM" ? 'text-sky-400 bg-sky-500/10' : 'text-slate-400'
-              }`}
-            >
-              <span>✈️</span>
-              <span>التلغرام</span>
-            </button>
-          </nav>
+              <div className="lg:col-span-4 flex flex-col gap-3.5">
+                {renderCortexPanel()}
+                {renderNeuralStream()}
+              </div>
+            </div>
+
+            {/* 3. عرض الهاتف الذكي (Mobile Views) */}
+            <div className="flex lg:hidden flex-col gap-3 flex-1">
+              {mobileNav === "CHART" && (
+                <>
+                  <div className="vision-card p-3 flex flex-col">
+                    <div className="flex items-center justify-between gap-1.5 pb-2 mb-1.5 border-b border-white/[0.06]">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-bold text-slate-200">الشارت ({state.tf_min}m)</span>
+                        <span className="vision-pill px-2 py-0.5 text-[10px] mono text-amber-300">
+                          ⏱ {formatCountdown(state.candle_rem_s || 0)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1 text-[10px]">
+                        <button
+                          onClick={() => setShowEMA(!showEMA)}
+                          className={`px-2 py-0.5 rounded border ${
+                            showEMA ? 'bg-sky-500/15 text-sky-300 border-sky-500/30' : 'bg-white/5 text-slate-400 border-white/5'
+                          }`}
+                        >
+                          EMA
+                        </button>
+                        <button
+                          onClick={() => setShowZones(!showZones)}
+                          className={`px-2 py-0.5 rounded border ${
+                            showZones ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/5'
+                          }`}
+                        >
+                          KDE
+                        </button>
+                        <button
+                          onClick={() => setShowVP(!showVP)}
+                          className={`px-2 py-0.5 rounded border ${
+                            showVP ? 'bg-purple-500/15 text-purple-300 border-purple-500/30' : 'bg-white/5 text-slate-400 border-white/5'
+                          }`}
+                        >
+                          POC
+                        </button>
+                      </div>
+                    </div>
+
+                    <TradingChart
+                      candles={snapshotCandles}
+                      latestCandle={latestCandle}
+                      zones={state.discovered_zones}
+                      openPos={pos}
+                      poc={cog.poc}
+                      vah={cog.vah}
+                      val={cog.val}
+                      emaFastSeries={emaFastSeries}
+                      emaSlowSeries={emaSlowSeries}
+                      emaFastPoint={emaFastPoint}
+                      emaSlowPoint={emaSlowPoint}
+                      showZones={showZones}
+                      showVP={showVP}
+                      showEMA={showEMA}
+                    />
+                  </div>
+
+                  <div className="vision-card p-3.5">
+                    <div className="flex items-center justify-between mb-2 pb-2 border-b border-white/[0.06]">
+                      <span className="text-xs font-bold gold-gradient-text">الصفقة النشطة وحالة القرار</span>
+                      <span className="text-[11px] font-bold mono text-amber-300">{cog.confidence}% | {cog.macro_bias}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-300 mb-2.5">{cog.block_reason}</p>
+                    {renderActivePosition()}
+                  </div>
+                </>
+              )}
+
+              {mobileNav === "CORTEX" && renderCortexPanel()}
+
+              {mobileNav === "LOGS" && (
+                <>
+                  <div className="vision-card p-3.5">
+                    <h3 className="text-xs font-extrabold text-slate-200 pb-2 mb-2.5 border-b border-white/[0.06]">
+                      سجل الصفقات ({state.trade_log.length})
+                    </h3>
+                    {renderTradeHistory()}
+                  </div>
+                  {renderNeuralStream()}
+                </>
+              )}
+
+              {mobileNav === "TELEGRAM" && (
+                <div className="vision-card p-3.5">
+                  <h3 className="text-xs font-extrabold text-sky-400 pb-2 mb-3 border-b border-white/[0.06]">
+                    ✈️ إعدادات ربط تلغرام والتقرير اليومي
+                  </h3>
+                  {renderTelegramSettings()}
+                </div>
+              )}
+            </div>
+
+            {/* 4. كبسولة التنقل السفلية العائمة للهاتف (iOS 18 Floating Pill Dock) */}
+            <nav className="lg:hidden fixed bottom-3 left-3 right-3 z-50 vision-card px-2 py-1.5 flex items-center justify-around">
+              <button
+                onClick={() => setMobileNav("CHART")}
+                className={`relative flex flex-col items-center gap-0.5 px-3.5 py-1 rounded-xl text-[11px] font-bold transition ${
+                  mobileNav === "CHART" ? 'text-amber-300 bg-amber-500/15' : 'text-slate-400'
+                }`}
+              >
+                <span>📈</span>
+                <span>الشارت</span>
+                {pos && <span className="absolute top-1 right-2 w-2 h-2 rounded-full bg-emerald-400 dot-live"></span>}
+              </button>
+              <button
+                onClick={() => setMobileNav("CORTEX")}
+                className={`flex flex-col items-center gap-0.5 px-3.5 py-1 rounded-xl text-[11px] font-bold transition ${
+                  mobileNav === "CORTEX" ? 'text-amber-300 bg-amber-500/15' : 'text-slate-400'
+                }`}
+              >
+                <span>🧠</span>
+                <span>الوعي الكمي</span>
+              </button>
+              <button
+                onClick={() => setMobileNav("LOGS")}
+                className={`flex flex-col items-center gap-0.5 px-3.5 py-1 rounded-xl text-[11px] font-bold transition ${
+                  mobileNav === "LOGS" ? 'text-amber-300 bg-amber-500/15' : 'text-slate-400'
+                }`}
+              >
+                <span>📜</span>
+                <span>السجل ({state.trade_log.length})</span>
+              </button>
+              <button
+                onClick={() => setMobileNav("TELEGRAM")}
+                className={`flex flex-col items-center gap-0.5 px-3.5 py-1 rounded-xl text-[11px] font-bold transition ${
+                  mobileNav === "TELEGRAM" ? 'text-sky-300 bg-sky-500/15' : 'text-slate-400'
+                }`}
+              >
+                <span>✈️</span>
+                <span>التلغرام</span>
+              </button>
+            </nav>
+
+          </div>
         </div>
       );
     }
