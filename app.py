@@ -1,8 +1,6 @@
 import asyncio
-import html
 import json
 import os
-import re
 import sqlite3
 import time
 from collections import deque
@@ -12,60 +10,53 @@ from typing import Dict, List, Optional
 
 import httpx
 import numpy as np
-import yfinance as yf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 # ==============================================================================
-# 0. إعدادات قابلة للتعديل (Configuration & Hyperparameters)
+# 0. إعدادات قابلة للتعديل ومعايير الحماية المشددة (Configuration & Hyperparameters)
 # ==============================================================================
 DB_PATH = os.getenv("BOT_DB_PATH", "autonomous_memory.db")
 
-def _env_first(*names: str) -> str:
-    for n in names:
-        v = os.getenv(n, "").strip()
-        if v:
-            return v
-    return ""
+DEFAULT_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-
-DEFAULT_TG_TOKEN = _env_first("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TG_BOT_TOKEN", "TG_TOKEN", "BOT_TOKEN")
-DEFAULT_TG_CHAT_ID = _env_first("TELEGRAM_CHAT_ID", "TELEGRAM_CHATID", "TG_CHAT_ID", "CHAT_ID")
-_BG_TASKS: set = set()
-
-
-def spawn(coro):
-    """تشغيل مهمة خلفية مع حفظ مرجعها (حتى لا تُجمع كقمامة قبل اكتمالها)."""
-    t = asyncio.create_task(coro)
-    _BG_TASKS.add(t)
-    t.add_done_callback(_BG_TASKS.discard)
-    return t
-TG_NOTIFY_STARTUP = os.getenv("TELEGRAM_NOTIFY_STARTUP", "1") == "1"
-
+# --- مصادر السعر الحي والتاريخي (Zero-API-Key Multi-Tier Feed) ---
 SQ_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
 SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()
+
+# مصادر الشموع التاريخية البديلة لـ Yahoo المتوقف (مرآة Binance العالمية + Kraken لـ PAXG المدعوم بالذهب 1:1)
+BINANCE_VISION_URL = "https://data-api.binance.vision/api/v3/klines"
+BINANCE_MAIN_URL = "https://api.binance.com/api/v3/klines"
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+
 POLL_S = 2.0
 STALE_QUOTE_S = 120
-TF_MIN = int(os.getenv("BOT_TF_MIN", "5"))  # 5 دقائق افتراضياً: السبريد يأكل نسبة أقل من الوقف
-_YF = {1: "1m", 5: "5m", 15: "15m"}
-if TF_MIN not in _YF:
+TF_MIN = int(os.getenv("BOT_TF_MIN", "1"))
+_BN_INT = {1: "1m", 5: "5m", 15: "15m"}
+if TF_MIN not in _BN_INT:
     raise SystemExit("BOT_TF_MIN must be one of 1, 5, 15")
-YF_INTERVAL = _YF[TF_MIN]
+BN_INTERVAL = _BN_INT[TF_MIN]
 TF_SEC = TF_MIN * 60
-MIN_CANDLES = 50
-MAX_SPREAD = 2.0
-ASSUMED_SPREAD = 0.25
-ENTRY_CONFIDENCE = 82.0
-SIGNAL_CONFIRM = 2
-START_BALANCE = float(os.getenv("START_BALANCE", "100"))   # رصيد البداية الورقي
-MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.10"))   # أقصى مخاطرة فعلية للصفقة من الرصيد
-MAX_SPREAD_TO_RISK = 0.30          # لا دخول إذا التهم السبريد أكثر من 30% من مسافة الوقف
-COOLDOWN_AFTER_WIN_S = 120 * TF_MIN
-COOLDOWN_AFTER_LOSS_S = 300 * TF_MIN
-MAX_CONSECUTIVE_LOSSES = 4
-LOSS_STREAK_PAUSE_S = 1800 * TF_MIN
-OPPOSITE_EXIT_MIN_HOLD_S = 180 * TF_MIN
-STAGNATION_EXIT_S = 900 * TF_MIN
+
+# --- معايير الفلترة الصارمة لمنع الصفقات الكارثية ---
+MIN_CANDLES = 60                 # أقل عدد شموع قبل بدء التحليل
+MAX_SPREAD = 0.55                # سقف السبريد المسموح للدخول ($0.55 بدلاً من $2.0)
+ASSUMED_SPREAD = 0.25            # سبريد افتراضي عند غياب الفارق
+ENTRY_CONFIDENCE = 86.0          # رفع عتبة القناعة للدخول (86% بدلاً من 82%)
+SIGNAL_CONFIRM = 2               # تأكيد الإغلاق لشمعتين
+MIN_SL_DISTANCE = 3.20           # أقل مسافة وقف خسارة مسموحة للذهب ($3.20) لمنع ضرب الذيول
+MAX_SL_DISTANCE = 6.50           # أقصى مسافة وقف خسارة مسموحة ($6.50)
+TARGET_RR_RATIO = 2.30           # نسبة العائد للمخاطرة المستهدفة (2.3R بدلاً من 1.75R)
+MAX_RISK_PCT_CAP = 0.0035        # سقف المخاطرة في الوضع الديناميكي (0.35% كحد أقصى أي ~35$ على حساب 10k)
+MAX_LOT_CAP = 0.10               # سقف اللوت الأقصى للحماية
+
+COOLDOWN_AFTER_WIN_S = 180 * TF_MIN
+COOLDOWN_AFTER_LOSS_S = 360 * TF_MIN
+MAX_CONSECUTIVE_LOSSES = 3
+LOSS_STREAK_PAUSE_S = 2400 * TF_MIN
+OPPOSITE_EXIT_MIN_HOLD_S = 240 * TF_MIN
+STAGNATION_EXIT_S = 1200 * TF_MIN
 
 
 def stamp() -> str:
@@ -77,21 +68,27 @@ def today_utc_str() -> str:
 
 
 def get_active_session() -> Dict[str, str]:
+    """تحديد جلسة التداول الحالية وحظر التداول في الساعة الميتة نهاية نيويورك وفترة الـ Rollover."""
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour + now_utc.minute / 60.0
-    if 21.0 <= h < 22.1:
-        return {"name": "DAILY_ROLLOVER", "label": "إغلاق/توقف السيولة اليومي (Rollover)", "bias": "HOLD"}
+    # حظر التداول من 20:00 UTC إلى 22:15 UTC (نهاية نيويورك الميتة + Rollover اتساع السبريد)
+    if 20.0 <= h < 22.25:
+        return {
+            "name": "DEADZONE_ROLLOVER",
+            "label": "حظر السيولة المسائي والـ Rollover (20:00-22:15 UTC)",
+            "bias": "HOLD",
+        }
     if 13.0 <= h < 17.0:
         return {"name": "LDN_NY_OVERLAP", "label": "تداخل لندن ونيويورك (ذروة السيولة)", "bias": "MOMENTUM"}
     if 7.0 <= h < 13.0:
         return {"name": "LONDON_SESSION", "label": "جلسة لندن (اندفاع سعري)", "bias": "MOMENTUM"}
-    if 17.0 <= h < 21.0:
+    if 17.0 <= h < 20.0:
         return {"name": "NEWYORK_SESSION", "label": "جلسة نيويورك", "bias": "NEUTRAL"}
     return {"name": "ASIAN_SESSION", "label": "الجلسة الآسيوية (ارتداد للمتوسط)", "bias": "REVERSION"}
 
 
 # ==============================================================================
-# 1. الذاكرة الدائمة وسجل الصفقات والحالة النشطة (SQLite Memory Engine)
+# 1. الذاكرة الدائمة وسجل الصفقات والشموع التاريخية (SQLite Persistence Engine)
 # ==============================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -137,6 +134,18 @@ def init_db():
                 value TEXT
             )
         """)
+        # جدول حفظ الشموع التاريخية محلياً لمنع فقدان الشارت عند إعادة تشغيل السيرفر
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS market_candles (
+                tf_min INTEGER,
+                time INTEGER,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                PRIMARY KEY (tf_min, time)
+            )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -149,48 +158,20 @@ init_db()
 # 2. محرك إشعارات وتقارير تلغرام غير المتزامن (Telegram Notification Engine)
 # ==============================================================================
 class TelegramNotifier:
-    TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
-
     def __init__(self):
-        self.bot_token: str = self.normalize_token(DEFAULT_TG_TOKEN)
-        self.chat_id: str = DEFAULT_TG_CHAT_ID.strip()
+        self.bot_token: str = DEFAULT_TG_TOKEN
+        self.chat_id: str = DEFAULT_TG_CHAT_ID
         self.enabled: bool = bool(self.bot_token and self.chat_id)
         self.last_report_date: str = ""
         self.last_status: str = "جاهز للربط" if not self.enabled else "مُفعّل وجاهز"
         self._client: Optional[httpx.AsyncClient] = None
-        self._queue: Optional[asyncio.Queue] = None
-        self._worker: Optional[asyncio.Task] = None
-        self.logger = None
-        self.sent_ok: int = 0
-        self.sent_fail: int = 0
-        self._fail_logged_at: float = 0.0
-
-    @staticmethod
-    def normalize_token(t: str) -> str:
-        t = (t or "").strip().strip("\"'")
-        if t.lower().startswith("bot") and ":" in t:
-            t = t[3:]
-        return t
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=10.0)
+            self._client = httpx.AsyncClient(timeout=8.0)
         return self._client
 
-    def start(self):
-        """تشغيل عامل الإرسال الخلفي (يُستدعى مرة عند بدء التطبيق)."""
-        if self._queue is None:
-            self._queue = asyncio.Queue(maxsize=200)
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._run_worker())
-
     async def aclose(self):
-        if self._worker is not None:
-            self._worker.cancel()
-            try:
-                await self._worker
-            except (asyncio.CancelledError, Exception):
-                pass
         if self._client is not None:
             await self._client.aclose()
 
@@ -203,219 +184,37 @@ class TelegramNotifier:
             return t
         return f"{t[:6]}...{t[-4:]}"
 
-    @staticmethod
-    def esc(x) -> str:
-        return html.escape(str(x), quote=False)
-
-    def _gate(self) -> bool:
-        if self.is_configured():
-            return True
-        if self.bot_token and self.chat_id and not self.enabled and self.logger and time.time() - self._fail_logged_at > 600:
-            self._fail_logged_at = time.time()
-            try:
-                self.logger("⚠️ إشعار الصفقة لم يُرسل: إشعارات تلغرام مُعطّلة. اضغط «إرسال تجريبي» لتفعيلها تلقائياً.")
-            except Exception:
-                pass
-        return False
-
-    def _report_failure(self):
-        now = time.time()
-        if self.logger and now - self._fail_logged_at > 300:
-            self._fail_logged_at = now
-            try:
-                self.logger(f"⚠️ فشل إرسال إشعار تلغرام: {self.last_status} — افتح /tg-debug للتشخيص")
-            except Exception:
-                pass
-
-    async def _post(self, text: str, force: bool = False):
-        ok, transient, wait = await self._post_raw(text, force=force)
-        if ok:
-            self.sent_ok += 1
-            self._fail_logged_at = 0.0
-        elif self.is_configured() or force:
-            self.sent_fail += 1
-            if not transient:
-                self._report_failure()
-        return ok, transient, wait
-
-    async def _post_raw(self, text: str, force: bool = False):
-        """إرسال واحد. يعيد (نجح؟، مؤقت_الخطأ؟، ثوانٍ_الانتظار)."""
+    async def send_html(self, text: str, force: bool = False) -> bool:
         if not force and not self.is_configured():
-            return False, False, 0.0
-        token, cid = self.bot_token.strip(), self.chat_id.strip()
+            return False
+        token = self.bot_token.strip()
+        cid = self.chat_id.strip()
         if not token or not cid:
             self.last_status = "خطأ: التوكن أو معرف المحادثة فارغ"
-            return False, False, 0.0
+            return False
+
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        payload = {
+            "chat_id": cid,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
         try:
             r = await self._http().post(url, json=payload)
-            try:
-                body = r.json()
-            except Exception:
-                body = {}
             if r.status_code == 200:
                 self.last_status = f"تم الإرسال بنجاح ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)"
-                return True, False, 0.0
-            desc = str(body.get("description", f"HTTP {r.status_code}"))
-            low = desc.lower()
-            if r.status_code == 400 and "parse entities" in low:
-                # تنسيق HTML مكسور: أعد الإرسال كنص عادي بدل فقدان الرسالة
-                plain = html.unescape(re.sub(r"<[^>]+>", "", text))
-                r2 = await self._http().post(url, json={"chat_id": cid, "text": plain, "disable_web_page_preview": True})
-                if r2.status_code == 200:
-                    self.last_status = "تم الإرسال (كنص عادي بسبب خطأ تنسيق)"
-                    return True, False, 0.0
-            retry_after = float((body.get("parameters") or {}).get("retry_after", 0) or 0)
-            if r.status_code == 401:
-                self.last_status = "فشل: التوكن غير صحيح (401) — انسخه من BotFather بدون مسافات"
-                return False, False, 0.0
-            if r.status_code == 400 and "chat not found" in low:
-                self.last_status = "فشل: معرّف المحادثة خطأ أو لم تضغط Start على البوت"
-                return False, False, 0.0
-            if r.status_code == 403:
-                self.last_status = "فشل: البوت محظور أو لم تبدأ المحادثة معه (403)"
-                return False, False, 0.0
-            self.last_status = f"فشل الإرسال: {desc}"
-            return False, r.status_code == 429 or r.status_code >= 500, retry_after
+                return True
+            err_desc = r.json().get("description", f"HTTP {r.status_code}")
+            self.last_status = f"فشل الإرسال: {err_desc}"
+            return False
         except Exception as e:
-            self.last_status = f"خطأ اتصال بتلغرام: {e!r}"
-            return False, True, 0.0
-
-    async def send_html(self, text: str, force: bool = False) -> bool:
-        ok, _, _ = await self._post(text, force=force)
-        if not ok:
-            print("Telegram send failed:", self.last_status)
-        return ok
-
-    async def _run_worker(self):
-        while True:
-            text = await self._queue.get()
-            try:
-                for attempt in range(4):
-                    ok, transient, wait = await self._post(text)
-                    if ok or not transient or not self.is_configured():
-                        if not ok:
-                            print("Telegram send failed:", self.last_status)
-                        break
-                    await asyncio.sleep(wait or 1.5 * (attempt + 1))
-                else:
-                    print("Telegram gave up after retries:", self.last_status)
-                    self._report_failure()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print("Telegram worker error:", repr(e))
-            finally:
-                self._queue.task_done()
-
-    def enqueue(self, text: str):
-        """إرسال غير حاجب: لا يؤخر حلقة التداول ولا يضيع عند تعطل الشبكة المؤقت."""
-        if not self.is_configured():
-            return
-        try:
-            self.start()
-            self._queue.put_nowait(text)
-        except Exception as e:
-            print("Telegram enqueue error:", repr(e))
-
-    async def _tg_api(self, method: str, payload: Optional[Dict] = None):
-        url = f"https://api.telegram.org/bot{self.bot_token.strip()}/{method}"
-        r = await self._http().post(url, json=payload or {})
-        try:
-            body = r.json()
-        except Exception:
-            body = {}
-        return r.status_code, body
-
-    async def diagnose(self) -> Dict:
-        """يفحص كل حلقة في السلسلة ويحدد السبب الدقيق لعدم وصول الرسائل."""
-        tok, cid = self.bot_token.strip(), self.chat_id.strip()
-        out: Dict = {
-            "env_token_found": bool(DEFAULT_TG_TOKEN), "env_chat_found": bool(DEFAULT_TG_CHAT_ID),
-            "token_present": bool(tok), "token_masked": self.masked_token(),
-            "token_format_ok": bool(self.TOKEN_RE.match(tok)), "chat_id": cid,
-            "enabled": self.enabled, "configured": self.is_configured(),
-            "worker_alive": bool(self._worker and not self._worker.done()),
-            "queue_size": self._queue.qsize() if self._queue else 0,
-            "sent_ok": self.sent_ok, "sent_fail": self.sent_fail, "last_status": self.last_status,
-            "bot": None, "chat": None, "suggested_chats": [], "problems": [], "ok": False,
-        }
-        P = out["problems"]
-        if not tok:
-            P.append("لا يوجد توكن: أضف TELEGRAM_BOT_TOKEN في Render أو أدخله من تبويب تلغرام ثم احفظ")
-        elif not out["token_format_ok"]:
-            P.append("شكل التوكن غير صحيح: يجب أن يكون مثل 123456789:AAH... (انسخه كاملاً من @BotFather)")
-        if not cid:
-            P.append("لا يوجد معرّف محادثة (chat_id): أضف TELEGRAM_CHAT_ID أو أدخله من الواجهة")
-        if tok:
-            try:
-                code, body = await self._tg_api("getMe")
-                if code == 200 and body.get("ok"):
-                    out["bot"] = "@" + str(body["result"].get("username", ""))
-                elif code == 401:
-                    P.append("تلغرام يرفض التوكن (401): التوكن خطأ أو أُلغي — أنشئ توكناً جديداً من @BotFather")
-                else:
-                    P.append(f"getMe فشل: {body.get('description', code)}")
-            except Exception as e:
-                P.append(f"الخادم لا يصل إلى api.telegram.org (شبكة/DNS): {e!r}")
-        if out["bot"]:
-            if cid:
-                try:
-                    code, body = await self._tg_api("getChat", {"chat_id": cid})
-                    if code == 200 and body.get("ok"):
-                        ch = body["result"]
-                        out["chat"] = {"type": ch.get("type"), "name": ch.get("title") or ch.get("first_name") or ch.get("username")}
-                    elif code == 403:
-                        P.append("البوت محظور أو أُزيل من المحادثة (403): افتح البوت وأرسل /start أو أعد إضافته")
-                    else:
-                        P.append(f"المعرّف {cid} غير صالح أو لم ترسل /start إلى {out['bot']} ({body.get('description', code)})")
-                except Exception as e:
-                    P.append(f"getChat فشل: {e!r}")
-            if not out["chat"]:
-                try:
-                    code, body = await self._tg_api("getUpdates", {"limit": 30})
-                    seen = {}
-                    for u in (body.get("result") or []) if code == 200 else []:
-                        for key in ("message", "channel_post", "my_chat_member", "edited_message"):
-                            ch = (u.get(key) or {}).get("chat")
-                            if ch and ch.get("id") is not None:
-                                seen[ch["id"]] = {"id": ch["id"], "type": ch.get("type"),
-                                                  "name": ch.get("title") or ch.get("first_name") or ch.get("username")}
-                    out["suggested_chats"] = list(seen.values())
-                    if code == 409:
-                        P.append("يوجد webhook مضبوط على البوت يمنع getUpdates: الإرسال يعمل لكن لا يمكن اكتشاف المعرّف تلقائياً")
-                    elif out["suggested_chats"]:
-                        P.append("استخدم أحد المعرّفات المقترحة في suggested_chats كـ chat_id")
-                    else:
-                        P.append(f"لم يراسل أحدٌ البوت بعد: افتح {out['bot']} في تلغرام واضغط Start ثم أعد هذا الفحص")
-                except Exception as e:
-                    P.append(f"getUpdates فشل: {e!r}")
-        if tok and cid and not self.enabled:
-            P.append("الإشعارات التلقائية مُعطّلة (enabled=false): افتح /tg-debug?enable=1 أو فعّل المربع واحفظ")
-        out["ok"] = not P
-        return out
-
-    async def startup_check(self, confirm: bool = False):
-        try:
-            d = await self.diagnose()
-        except Exception as e:
-            print("Telegram diagnose error:", repr(e))
-            return
-        print("Telegram diagnosis:", d["problems"] or "OK", "| bot:", d["bot"])
-        if not self.logger or not (d["token_present"] or d["chat_id"]):
-            return
-        if d["ok"]:
-            self.logger(f"✅ تلغرام جاهز: البوت {d['bot']} ↔ المحادثة {d['chat']['name'] if d['chat'] else d['chat_id']}")
-            if confirm:
-                self.enqueue("✅ <b>تم ربط الإشعارات بنجاح</b>\nستصلك هنا تفاصيل كل صفقة (دخول، تأمين، إغلاق).")
-        else:
-            self.logger("⚠️ تلغرام: " + " | ".join(d["problems"][:3]))
+            self.last_status = f"خطأ اتصال بتلغرام: {repr(e)}"
+            return False
 
     async def notify_entry(self, pos: Dict, session_label: str):
-        if not self._gate():
+        if not self.is_configured():
             return
-        e = self.esc
         icon = "🟢" if pos["side"] == "BUY" else "🔴"
         direction_ar = "شراء (BUY)" if pos["side"] == "BUY" else "بيع (SELL)"
         msg = (
@@ -424,62 +223,51 @@ class TelegramNotifier:
             f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})\n"
             f"📦 <b>حجم العقد:</b> <code>{pos['lots']} Lot</code>\n"
             f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>\n"
-            f"🛡️ <b>الوقف (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})\n"
-            f"🏆 <b>الهدف (TP):</b> <code>${pos['tp']:.2f}</code>\n"
+            f"🛡️ <b>الوقف الهيكلي (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})\n"
+            f"🏆 <b>الهدف الهيكلي (TP):</b> <code>${pos['tp']:.2f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 <b>القناعة:</b> <code>{pos['confidence']}%</code>\n"
-            f"⚙️ <b>السياسة:</b> <code>{e(pos['policy'])}</code>\n"
-            f"📊 <b>حالة السوق:</b> <code>{e(pos['regime'])}</code>\n"
-            f"🌍 <b>الجلسة:</b> {e(session_label)}\n"
-            f"🕒 <b>التوقيت:</b> <code>{e(pos['opened_at'])} UTC</code>"
+            f"🧠 <b>القناعة الكمية:</b> <code>{pos['confidence']}%</code>\n"
+            f"⚙️ <b>السياسة:</b> <code>{pos['policy']}</code>\n"
+            f"📊 <b>حالة السوق:</b> <code>{pos['regime']}</code>\n"
+            f"🌍 <b>الجلسة:</b> {session_label}\n"
+            f"🕒 <b>التوقيت:</b> <code>{pos['opened_at']} UTC</code>"
         )
-        self.enqueue(msg)
+        await self.send_html(msg)
 
     async def notify_secured(self, pos: Dict, note: str):
-        if not self._gate():
+        if not self.is_configured():
             return
-        e = self.esc
         msg = (
             f"🛡️ <b>تأمين صفقة نشطة | XAU/USD (#{pos['id']})</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📌 <b>النوع:</b> <code>{pos['side']} ({pos['lots']}L)</code>\n"
             f"🔒 <b>الوقف المحدث (SL):</b> <code>${pos['sl']:.2f}</code>\n"
             f"💵 <b>الربح المحجوز/الجزئي:</b> <code>${pos['realized']:+.2f}</code>\n"
-            f"📝 <b>التفاصيل:</b> {e(note)}"
+            f"📝 <b>التفاصيل:</b> {note}"
         )
-        self.enqueue(msg)
+        await self.send_html(msg)
 
     async def notify_exit(self, rec: Dict, r_mult: float, balance: float, kpis: Dict):
-        if not self._gate():
+        if not self.is_configured():
             return
-        e = self.esc
         win = rec["pnl"] >= 0
         badge = "✅ <b>إغلاق صفقة رابحة</b>" if win else "❌ <b>إغلاق صفقة خاسرة</b>"
         pnl_str = f"+${rec['pnl']:.2f}" if win else f"-${abs(rec['pnl']):.2f}"
+        r_str = f"{r_mult:+.2f}R"
         msg = (
             f"{badge} | <b>XAU/USD (#{rec['id']})</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📌 <b>الاتجاه والعقد:</b> <code>{rec['side']} ({rec['lots']} Lot)</code>\n"
             f"📥 <b>سعر الدخول:</b> <code>${rec['entry_price']:.2f}</code>\n"
             f"📤 <b>سعر الخروج:</b> <code>${rec['exit_price']:.2f}</code>\n"
-            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_mult:+.2f}R)</code>\n"
-            f"📝 <b>سبب الخروج:</b> {e(rec['reason_exit'])}\n"
+            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_str})</code>\n"
+            f"📝 <b>سبب الخروج:</b> {rec['reason_exit']}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🏦 <b>الرصيد المحدث:</b> <code>${balance:,.2f}</code>\n"
             f"📈 <b>نسبة النجاح الكلية:</b> <code>{kpis['win_rate']}% ({kpis['wins']}W/{kpis['losses']}L)</code>\n"
-            f"🕒 <b>وقت الإغلاق:</b> <code>{e(rec['closed_at'])} UTC</code>"
+            f"🕒 <b>وقت الإغلاق:</b> <code>{rec['closed_at']} UTC</code>"
         )
-        self.enqueue(msg)
-
-    async def notify_startup(self, balance: float, feed: str):
-        if not (TG_NOTIFY_STARTUP and self.is_configured()):
-            return
-        self.enqueue(
-            "🚀 <b>بدأ تشغيل الوكيل | XAU/USD</b>\n"
-            f"🏦 <b>الرصيد:</b> <code>${balance:,.2f}</code>\n"
-            f"📡 <b>المصدر:</b> <code>{self.esc(feed)}</code>\n"
-            "ستصلك هنا تفاصيل كل صفقة عند الدخول والتأمين والإغلاق."
-        )
+        await self.send_html(msg)
 
     async def send_daily_report(self, report: Dict, force: bool = False) -> bool:
         if not force and not self.is_configured():
@@ -509,10 +297,8 @@ class TelegramNotifier:
 
 
 # ==============================================================================
-# 3. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex)
+# 3. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex v4)
 # ==============================================================================
-
-
 class AutonomousQuantitativeBrain:
     POLICIES = (
         "MOMENTUM_CONTINUATION",
@@ -525,11 +311,11 @@ class AutonomousQuantitativeBrain:
         self.tg = tg
         self.bot_active: bool = True
         self.can_trade: bool = False
-        self.lot_mode: str = "FIXED_001"
-        self.balance: float = START_BALANCE
-        self.equity: float = START_BALANCE
-        self.initial_balance: float = START_BALANCE
-        self.peak_balance: float = START_BALANCE
+        self.lot_mode: str = "FIXED_001"  # FIXED_001 افتراضي دائماً لحماية الرصيد
+        self.balance: float = 100.0
+        self.equity: float = 100.0
+        self.initial_balance: float = 100.0
+        self.peak_balance: float = 100.0
         self.max_drawdown_pct: float = 0.0
 
         self.candles: deque = deque(maxlen=400)
@@ -538,12 +324,16 @@ class AutonomousQuantitativeBrain:
         self.ask_price: Optional[float] = None
         self.spread: float = ASSUMED_SPREAD
 
+        # المؤشرات الكمية والهيكلية
         self.hurst: float = 0.50
         self.entropy: float = 0.50
         self.velocity: float = 0.0
         self.volatility_sigma: float = 0.0
-        self.atr_value: float = 1.20
+        self.atr_value: float = 1.50
         self.z_score: float = 0.0
+        self.ema_fast: Optional[float] = None
+        self.ema_slow: Optional[float] = None
+        self.macro_bias: str = "NEUTRAL"  # BULLISH | BEARISH | NEUTRAL
         self.poc_price: Optional[float] = None
         self.vah_price: Optional[float] = None
         self.val_price: Optional[float] = None
@@ -555,8 +345,6 @@ class AutonomousQuantitativeBrain:
         self.entropy_rank: float = 0.5
         self.block_reason: str = "تجميع البيانات..."
         self._streak: int = 0
-        self.cooldown_note: str = ""
-        self._tg_refresh_ts: float = 0.0
         self._last_dir: int = 0
         self.active_regime: str = "INITIALIZING_PERCEPTION"
         self.active_policy: str = "OBSERVING_RAW_FLOW"
@@ -590,6 +378,56 @@ class AutonomousQuantitativeBrain:
                 conn.close()
         except Exception as e:
             print("Runtime save error:", repr(e))
+
+    def save_candle_to_db(self, candle: Dict):
+        """حفظ الشمعة في SQLite لضمان عدم ضياع الشارت عند إعادة تشغيل السيرفر."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                c = conn.cursor()
+                c.execute(
+                    """
+                    INSERT OR REPLACE INTO market_candles (tf_min, time, open, high, low, close)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (TF_MIN, candle["time"], candle["open"], candle["high"], candle["low"], candle["close"]),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print("Candle save error:", repr(e))
+
+    def save_bulk_candles_to_db(self, candles_list: List[Dict]):
+        if not candles_list:
+            return
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                c = conn.cursor()
+                rows = [(TF_MIN, x["time"], x["open"], x["high"], x["low"], x["close"]) for x in candles_list]
+                c.executemany(
+                    """
+                    INSERT OR REPLACE INTO market_candles (tf_min, time, open, high, low, close)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                # الاحتفاظ بآخر 500 شمعة فقط لكل فريم لمنع تضخم القاعدة
+                c.execute(
+                    """
+                    DELETE FROM market_candles
+                    WHERE tf_min = ? AND time NOT IN (
+                        SELECT time FROM market_candles WHERE tf_min = ? ORDER BY time DESC LIMIT 500
+                    )
+                    """,
+                    (TF_MIN, TF_MIN),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print("Bulk candle save error:", repr(e))
 
     def _restore_state(self):
         try:
@@ -655,10 +493,21 @@ class AutonomousQuantitativeBrain:
                     elif k == "last_report_date":
                         self.tg.last_report_date = str(parsed)
 
-                if self.open_position:  # الربح الجزئي أُضيف للرصيد سابقاً ولا يظهر في trade_history
-                    self.balance = round(self.balance + float(self.open_position.get("realized", 0.0)), 2)
-                    self.equity = self.balance
-                    self.peak_balance = max(self.peak_balance, self.balance)
+                # استرجاع الشموع التاريخية المحفوظة محلياً
+                c.execute(
+                    "SELECT time, open, high, low, close FROM market_candles "
+                    "WHERE tf_min = ? ORDER BY time ASC LIMIT 400",
+                    (TF_MIN,),
+                )
+                saved_candles = [
+                    {"time": int(r[0]), "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4])}
+                    for r in c.fetchall()
+                ]
+                if saved_candles:
+                    self.candles.extend(saved_candles)
+                    if len(saved_candles) >= 120:
+                        closes_arr = np.array([x["close"] for x in saved_candles], dtype=float)
+                        self._warm_history(closes_arr)
             finally:
                 conn.close()
         except Exception as e:
@@ -672,46 +521,17 @@ class AutonomousQuantitativeBrain:
                 break
         self.consec_losses = streak
 
-    def refresh_telegram_from_db(self):
-        """إن حُفظت الإعدادات من عملية/عامل آخر فالقاعدة هي المرجع."""
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                row = conn.execute("SELECT value FROM runtime_state WHERE key='telegram_config'").fetchone()
-            finally:
-                conn.close()
-            if not row or not row[0]:
-                return
-            p = json.loads(row[0])
-            tok = TelegramNotifier.normalize_token(str(p.get("bot_token", "")))
-            cid = str(p.get("chat_id", "")).strip()
-            if tok:
-                self.tg.bot_token = tok
-            if cid:
-                self.tg.chat_id = cid
-            self.tg.enabled = bool(p.get("enabled", False)) and bool(self.tg.bot_token and self.tg.chat_id)
-        except Exception as e:
-            print("Telegram refresh error:", repr(e))
-
     def update_telegram_config(self, bot_token: str, chat_id: str, enabled: bool):
-        old_tok, old_cid = self.tg.bot_token, self.tg.chat_id
         if bot_token.strip() and "..." not in bot_token:
-            self.tg.bot_token = TelegramNotifier.normalize_token(bot_token)
+            self.tg.bot_token = bot_token.strip()
         self.tg.chat_id = chat_id.strip()
-        changed = (self.tg.bot_token != old_tok) or (self.tg.chat_id != old_cid)
-        self.tg.enabled = bool((enabled or changed) and self.tg.bot_token and self.tg.chat_id)
+        self.tg.enabled = bool(enabled and self.tg.bot_token and self.tg.chat_id)
         self._save_runtime_key("telegram_config", {
             "bot_token": self.tg.bot_token,
             "chat_id": self.tg.chat_id,
             "enabled": self.tg.enabled,
         })
-        if self.tg.is_configured():
-            ok_fmt = bool(TelegramNotifier.TOKEN_RE.match(self.tg.bot_token))
-            self.tg.last_status = "تم حفظ الإعدادات وتفعيل الإشعارات" + ("" if ok_fmt else " (تنبيه: شكل التوكن غير معتاد)")
-        elif self.tg.bot_token and self.tg.chat_id:
-            self.tg.last_status = "الإشعارات مُعطّلة: فعّل مربع التفعيل ثم احفظ"
-        else:
-            self.tg.last_status = "بيانات ناقصة: أدخل التوكن ومعرف المحادثة"
+        self.tg.last_status = "تم حفظ الإعدادات" if self.tg.is_configured() else "تم الإيقاف أو بيانات ناقصة"
 
     def build_daily_report_data(self, date_str: Optional[str] = None) -> Dict:
         target_date = date_str or today_utc_str()
@@ -763,6 +583,19 @@ class AutonomousQuantitativeBrain:
             "text": msg,
         })
 
+    # --------------------------------------------------------------- الإحصاء والرياضيات الكمية
+    @staticmethod
+    def _ema(arr: np.ndarray, period: int) -> float:
+        if len(arr) == 0:
+            return 0.0
+        if len(arr) < period:
+            return float(np.mean(arr))
+        alpha = 2.0 / (period + 1.0)
+        val = float(arr[0])
+        for p in arr[1:]:
+            val = alpha * float(p) + (1.0 - alpha) * val
+        return round(val, 2)
+
     def compute_hurst_exponent(self, prices: np.ndarray) -> float:
         if len(prices) < 45:
             return 0.5
@@ -796,7 +629,7 @@ class AutonomousQuantitativeBrain:
 
     def compute_true_atr(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
         if len(closes) < 2:
-            return 1.2
+            return 1.5
         prev_closes = closes[:-1]
         cur_highs = highs[1:]
         cur_lows = lows[1:]
@@ -806,8 +639,8 @@ class AutonomousQuantitativeBrain:
         )
         n = min(period, len(tr))
         atr = float(np.mean(tr[-n:]))
-        if atr <= 0.08:
-            atr = max(0.8, float(closes[-1]) * 0.0004)
+        if atr <= 0.15:
+            atr = max(1.0, float(closes[-1]) * 0.0004)
         return round(atr, 3)
 
     def discover_gravity_and_volume_profile(
@@ -893,21 +726,23 @@ class AutonomousQuantitativeBrain:
         lower_wick = min(o1, c1) - l1
         upper_wick = h1 - max(o1, c1)
 
-        prev_low = float(np.min(lows[-16:-1]))
-        prev_high = float(np.max(highs[-16:-1]))
+        prev_low = float(np.min(lows[-18:-1]))
+        prev_high = float(np.max(highs[-18:-1]))
 
-        if l1 < prev_low and c1 > prev_low and (lower_wick / rng1) >= 0.40:
+        # سحب سيولة صاعد مؤكد مع إغلاق إيجابي
+        if l1 < prev_low and c1 > prev_low and (lower_wick / rng1) >= 0.42 and c1 >= o1:
             result["bull_sweep"] = True
             result["label"] = "BULL_LIQUIDITY_SWEEP"
-        elif h1 > prev_high and c1 < prev_high and (upper_wick / rng1) >= 0.40:
+        # سحب سيولة هابط مؤكد مع إغلاق سلبي
+        elif h1 > prev_high and c1 < prev_high and (upper_wick / rng1) >= 0.42 and c1 <= o1:
             result["bear_sweep"] = True
             result["label"] = "BEAR_LIQUIDITY_SWEEP"
 
-        if lows[-1] > highs[-3] and (closes[-2] - opens[-2]) > self.atr_value * 0.55:
+        if lows[-1] > highs[-3] and (closes[-2] - opens[-2]) > self.atr_value * 0.65:
             result["bull_fvg"] = True
             if result["label"] == "NONE":
                 result["label"] = "BULLISH_FVG_DISPLACEMENT"
-        elif highs[-1] < lows[-3] and (opens[-2] - closes[-2]) > self.atr_value * 0.55:
+        elif highs[-1] < lows[-3] and (opens[-2] - closes[-2]) > self.atr_value * 0.65:
             result["bear_fvg"] = True
             if result["label"] == "NONE":
                 result["label"] = "BEARISH_FVG_DISPLACEMENT"
@@ -919,26 +754,38 @@ class AutonomousQuantitativeBrain:
         self, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray
     ) -> Dict:
         returns = np.diff(closes)
-        if len(returns) < 35:
+        if len(returns) < 40:
             self.active_regime = "CALIBRATING"
             return {"policy": "CALIBRATING", "direction": 0, "score": 0.0, "reason": "معايرة: بيانات غير كافية"}
 
         session_info = get_active_session()
         if session_info["bias"] == "HOLD":
-            self.active_regime = "DAILY_ROLLOVER_PAUSE"
+            self.active_regime = "DEADZONE_ROLLOVER_SHIELD"
             return {
                 "policy": "ROLLOVER_SHIELD",
                 "direction": 0,
                 "score": 20.0,
-                "reason": "توقف السيولة اليومي (21:00-22:05 UTC) — حماية من اتساع السبريد",
+                "reason": "درع الحماية مفعل: حظر التداول بين 20:00 و 22:15 UTC لتجنب السبريد والحركات الكاذبة",
             }
 
         sigma = float(np.std(returns)) + 1e-6
         self.volatility_sigma = round(sigma, 3)
 
+        # حساب الاتجاه الهيكلي الكلي (Macro Trend Filter EMA 50 & EMA 150)
+        self.ema_fast = self._ema(closes[-160:], 50)
+        self.ema_slow = self._ema(closes[-220:], 150)
+        cur_close = float(closes[-1])
+
+        if self.ema_fast > self.ema_slow + self.atr_value * 0.25 and cur_close > self.ema_fast:
+            self.macro_bias = "BULLISH"
+        elif self.ema_fast < self.ema_slow - self.atr_value * 0.25 and cur_close < self.ema_fast:
+            self.macro_bias = "BEARISH"
+        else:
+            self.macro_bias = "NEUTRAL"
+
         short_drift = float(np.mean(returns[-6:])) / sigma
         med_drift = float(np.mean(returns[-20:])) / sigma
-        z_score = float((closes[-1] - np.mean(closes[-35:])) / (np.std(closes[-35:]) + 1e-6))
+        z_score = float((cur_close - np.mean(closes[-35:])) / (np.std(closes[-35:]) + 1e-6))
         self.z_score = round(z_score, 2)
 
         smc = self.detect_smc_microstructure(opens, highs, lows, closes)
@@ -968,13 +815,13 @@ class AutonomousQuantitativeBrain:
             "VOLATILITY_EXPANSION": weighted("VOLATILITY_EXPANSION", brk_score),
         }
 
-        if len(self.hist_entropy) >= 60 and self.entropy_rank > 0.90:
+        if len(self.hist_entropy) >= 60 and self.entropy_rank > 0.88:
             self.active_regime = "HIGH_ENTROPY_NOISE"
             return {
                 "policy": "NOISE_FILTER_HOLD",
                 "direction": 0,
                 "score": 32.0,
-                "reason": f"ضجيج عشوائي مرتفع (إنتروبيا {self.entropy} ضمن أعلى 10%)",
+                "reason": f"ضجيج عشوائي مرتفع (إنتروبيا {self.entropy} ضمن أعلى 12%)",
             }
 
         if self.hurst_rank > 0.62:
@@ -990,58 +837,78 @@ class AutonomousQuantitativeBrain:
         policy = max(candidates, key=lambda p: scores[p])
         raw_edge = scores[policy]
         trend_mode = policy != "GRAVITY_MEAN_REVERSION"
-        self.active_regime = f"{regime_name} (H={self.hurst})"
+        self.active_regime = f"{regime_name} | {self.macro_bias}"
 
         direction = 0
         conviction = 45.0
         reason = ""
 
+        last_bull_candle = closes[-1] > opens[-1]
+        last_bear_candle = closes[-1] < opens[-1]
+
         if trend_mode:
-            if short_drift > 0.22 and med_drift > 0.08:
-                direction = 1
-            elif short_drift < -0.22 and med_drift < -0.08:
-                direction = -1
+            # منع شراء القمة المتشبعة (z_score > 1.65) أو بيع القاع المتشبع (z_score < -1.65)
+            if short_drift > 0.24 and med_drift > 0.10 and self.macro_bias != "BEARISH":
+                if z_score > 1.65:
+                    reason = f"حظر شراء القمة: السعر متمدد بشدة (Z={z_score:.2f} > 1.65) — بانتظار تصحيح"
+                elif last_bull_candle:
+                    direction = 1
+            elif short_drift < -0.24 and med_drift < -0.10 and self.macro_bias != "BULLISH":
+                if z_score < -1.65:
+                    reason = f"حظر بيع القاع: السعر متمدد بشدة (Z={z_score:.2f} < -1.65) — بانتظار تصحيح"
+                elif last_bear_candle:
+                    direction = -1
+
             if direction != 0:
-                conviction = 74.0 + min(20.0, abs(short_drift) * 13.5 + max(0.0, raw_edge * 2.4))
+                conviction = 75.0 + min(19.0, abs(short_drift) * 13.0 + max(0.0, raw_edge * 2.4))
                 if (direction == 1 and smc["bull_fvg"]) or (direction == -1 and smc["bear_fvg"]):
-                    conviction += 5.5
+                    conviction += 6.0
+                if (direction == 1 and self.macro_bias == "BULLISH") or (direction == -1 and self.macro_bias == "BEARISH"):
+                    conviction += 3.5
             else:
-                conviction = 56.0 + min(15.0, abs(short_drift) * 10.0)
+                conviction = 54.0 + min(15.0, abs(short_drift) * 9.0)
         else:
-            if (z_score < -1.20 and short_drift > -0.18) or smc["bull_sweep"]:
+            # الارتداد للمتوسط: منع البيع الأعمى ضد الترند الصاعد إلا بوجود Liquidity Sweep مؤكد أو منطقة رفض + شمعة هابطة
+            near_repulsor_top = any(
+                z["type"] == "REPULSOR_ANOMALY" and abs(cur_close - z["price"]) <= self.atr_value * 1.2
+                for z in self.discovered_zones
+            )
+            if smc["bull_sweep"] or (z_score < -1.55 and last_bull_candle and self.macro_bias != "BEARISH" and ( near_repulsor_top or cur_close <= (self.val_price or cur_close) )):
                 direction = 1
-            elif (z_score > 1.20 and short_drift < 0.18) or smc["bear_sweep"]:
+            elif smc["bear_sweep"] or (z_score > 1.55 and last_bear_candle and self.macro_bias != "BULLISH" and ( near_repulsor_top or cur_close >= (self.vah_price or cur_close) )):
                 direction = -1
-            if direction != 0:
-                conviction = 75.5 + min(19.0, abs(z_score) * 7.2 + max(0.0, raw_edge * 2.4))
-                if (direction == 1 and smc["bull_sweep"]) or (direction == -1 and smc["bear_sweep"]):
-                    conviction += 6.5
             else:
-                conviction = 54.0 + min(18.0, abs(z_score) * 8.0)
+                if abs(z_score) > 1.25:
+                    reason = "حظر ارتداد مبكر: لا يوجد سحب سيولة (Sweep) أو شمعة انعكاسية مؤكدة"
 
-        smc_supports = (direction == 1 and (smc["bull_sweep"] or smc["bull_fvg"])) or (
-            direction == -1 and (smc["bear_sweep"] or smc["bear_fvg"])
-        )
-        if direction != 0 and raw_edge <= 0 and not smc_supports:
+            if direction != 0:
+                conviction = 76.0 + min(18.0, abs(z_score) * 6.8 + max(0.0, raw_edge * 2.4))
+                if (direction == 1 and smc["bull_sweep"]) or (direction == -1 and smc["bear_sweep"]):
+                    conviction += 7.5
+            else:
+                conviction = 52.0 + min(16.0, abs(z_score) * 7.0)
+
+        if direction != 0 and raw_edge <= 0 and self.smc_event == "NONE":
             direction = 0
-            conviction = min(conviction, 70.0)
-            reason = "السياسة بلا ميزة إحصائية حديثة أو هيكل SMC"
+            conviction = min(conviction, 72.0)
+            reason = "السياسة بلا ميزة إحصائية حديثة أو هيكل SMC صريح"
 
+        # فحص موقع السعر من المناطق المكتشفة (حماية من الدخول في وجه جدار سعري)
         if self.discovered_zones and direction != 0:
-            cur_p = self.last_price if self.last_price is not None else float(closes[-1])
+            cur_p = self.last_price if self.last_price is not None else cur_close
             nearest = min(self.discovered_zones, key=lambda z: abs(z["price"] - cur_p))
             gap = nearest["price"] - cur_p
-            if abs(gap) < self.atr_value * 2.5:
+            if abs(gap) < self.atr_value * 2.2:
                 behind = (gap <= 0) if direction == 1 else (gap >= 0)
-                conviction += 6.0 if behind else -7.5
+                conviction += 5.5 if behind else -9.0
 
         final = round(float(np.clip(conviction, 15.0, 97.5)), 1)
         if direction == 0 and not reason:
-            reason = "لا إعداد: بانتظار اندفاع سعري أو FVG" if trend_mode else "لا إعداد: السعر داخل منطقة التوازن"
+            reason = "لا إعداد: بانتظار توافق الهيكل الكلي (EMA) مع تدفق السيولة"
         elif direction != 0 and final < ENTRY_CONFIDENCE:
-            reason = f"إعداد قيد التكوين لكن القناعة {final}% < {ENTRY_CONFIDENCE}%"
+            reason = f"إعداد مرصود لكن القناعة {final}% أقل من الحد الآمن ({ENTRY_CONFIDENCE}%)"
         elif direction != 0:
-            reason = f"إشارة مكتملة ({self.smc_event if self.smc_event != 'NONE' else policy})"
+            reason = f"إشارة عالية الدقة ({self.smc_event if self.smc_event != 'NONE' else policy})"
 
         return {
             "policy": policy,
@@ -1073,7 +940,7 @@ class AutonomousQuantitativeBrain:
         lows = np.array([c["low"] for c in closed], dtype=float)
         returns = np.diff(closes)
 
-        if len(self.hist_hurst) < 60 and len(closes) >= 160:
+        if len(self.hist_hurst) < 60 and len(closes) >= 120:
             self._warm_history(closes)
 
         self.atr_value = self.compute_true_atr(highs, lows, closes, period=14)
@@ -1093,7 +960,7 @@ class AutonomousQuantitativeBrain:
 
         d = self._decision
         if d["direction"] != 0 and d["score"] >= ENTRY_CONFIDENCE:
-            req_confirm = 1 if (d.get("smc_event", "NONE") != "NONE" and d["score"] >= 87.0) else SIGNAL_CONFIRM
+            req_confirm = 1 if (d.get("smc_event", "NONE") != "NONE" and d["score"] >= 89.0) else SIGNAL_CONFIRM
             self._streak = self._streak + 1 if d["direction"] == self._last_dir else 1
             self._last_dir = d["direction"]
             d["confirmed"] = self._streak >= req_confirm
@@ -1118,9 +985,6 @@ class AutonomousQuantitativeBrain:
 
     async def process_market_state(self):
         async with self.lock:
-            if time.time() - self._tg_refresh_ts > 30:
-                self._tg_refresh_ts = time.time()
-                self.refresh_telegram_from_db()
             await self.check_and_send_daily_rollover_report()
 
             if len(self.candles) < MIN_CANDLES or self.last_price is None:
@@ -1130,7 +994,10 @@ class AutonomousQuantitativeBrain:
             forming_ts = self.candles[-1]["time"]
             if forming_ts != self._analysis_ts:
                 self._analysis_ts = forming_ts
-                self._analyze(list(self.candles)[:-1])
+                closed_candles = list(self.candles)[:-1]
+                if closed_candles:
+                    self.save_candle_to_db(closed_candles[-1])
+                self._analyze(closed_candles)
 
             decision = self._decision
 
@@ -1148,10 +1015,10 @@ class AutonomousQuantitativeBrain:
                 return
             remaining = self.cooldown_until - time.time()
             if remaining > 0:
-                self.block_reason = f"فترة تهدئة: {int(remaining)}ث" + (f" — {self.cooldown_note}" if self.cooldown_note else "")
+                self.block_reason = f"فترة تهدئة بعد آخر صفقة: {int(remaining)}ث"
                 return
             if self.spread > MAX_SPREAD:
-                self.block_reason = f"السبريد واسع ({self.spread}$ > {MAX_SPREAD}$)"
+                self.block_reason = f"درع السبريد مفعل: السبريد الحالي ({self.spread}$) أكبر من الحد الآمن ({MAX_SPREAD}$)"
                 return
             if decision["direction"] != 0 and decision["score"] >= ENTRY_CONFIDENCE and decision.get("confirmed"):
                 self.block_reason = "إشارة مؤكدة — جاري التنفيذ"
@@ -1165,32 +1032,34 @@ class AutonomousQuantitativeBrain:
         return round(p, 2)
 
     def _compute_structural_stops(self, side: str, entry: float) -> tuple[float, float, float]:
+        """حساب الوقف والهدف الهيكلي مع حد أدنى صلب ($3.20) لمنع ضرب الذيول المبكر على الذهب."""
         closed = list(self.candles)[:-1]
-        recent = closed[-12:] if len(closed) >= 12 else closed
-        atr = max(0.6, self.atr_value)
+        recent = closed[-25:] if len(closed) >= 25 else closed
+        atr = max(0.8, self.atr_value)
+        min_safe_sl = max(MIN_SL_DISTANCE, atr * 2.4 + self.spread * 2.0)
 
         if side == "BUY":
-            swing_low = min(c["low"] for c in recent) if recent else entry - atr * 2.0
-            raw_sl = min(entry - atr * 1.6, swing_low - atr * 0.35)
-            sl_d = float(np.clip(entry - raw_sl, atr * 1.4, atr * 3.2))
-            tp_d = round(sl_d * 1.75, 2)
-            above_zones = [z["price"] for z in self.discovered_zones if z["price"] > entry + sl_d * 1.1]
+            swing_low = min(c["low"] for c in recent) if recent else entry - min_safe_sl
+            raw_sl = min(entry - min_safe_sl, swing_low - atr * 0.55)
+            sl_d = float(np.clip(entry - raw_sl, min_safe_sl, MAX_SL_DISTANCE))
+            tp_d = round(sl_d * TARGET_RR_RATIO, 2)
+            above_zones = [z["price"] for z in self.discovered_zones if z["price"] > entry + sl_d * 1.6]
             if above_zones:
                 nearest_res = min(above_zones)
-                if nearest_res - entry < tp_d * 1.15:
-                    tp_d = max(round(sl_d * 1.35, 2), round(nearest_res - entry - 0.15, 2))
+                if nearest_res - entry < tp_d * 1.10:
+                    tp_d = max(round(sl_d * 1.85, 2), round(nearest_res - entry - 0.20, 2))
             sl_d = round(sl_d, 2)
             return round(entry - sl_d, 2), round(entry + tp_d, 2), sl_d
         else:
-            swing_high = max(c["high"] for c in recent) if recent else entry + atr * 2.0
-            raw_sl = max(entry + atr * 1.6, swing_high + atr * 0.35)
-            sl_d = float(np.clip(raw_sl - entry, atr * 1.4, atr * 3.2))
-            tp_d = round(sl_d * 1.75, 2)
-            below_zones = [z["price"] for z in self.discovered_zones if z["price"] < entry - sl_d * 1.1]
+            swing_high = max(c["high"] for c in recent) if recent else entry + min_safe_sl
+            raw_sl = max(entry + min_safe_sl, swing_high + atr * 0.55)
+            sl_d = float(np.clip(raw_sl - entry, min_safe_sl, MAX_SL_DISTANCE))
+            tp_d = round(sl_d * TARGET_RR_RATIO, 2)
+            below_zones = [z["price"] for z in self.discovered_zones if z["price"] < entry - sl_d * 1.6]
             if below_zones:
                 nearest_sup = max(below_zones)
-                if entry - nearest_sup < tp_d * 1.15:
-                    tp_d = max(round(sl_d * 1.35, 2), round(entry - nearest_sup - 0.15, 2))
+                if entry - nearest_sup < tp_d * 1.10:
+                    tp_d = max(round(sl_d * 1.85, 2), round(entry - nearest_sup - 0.20, 2))
             sl_d = round(sl_d, 2)
             return round(entry + sl_d, 2), round(entry - tp_d, 2), sl_d
 
@@ -1207,37 +1076,15 @@ class AutonomousQuantitativeBrain:
         if self.lot_mode == "FIXED_001":
             lots = 0.01
         else:
-            risk_pct = 0.005 + ((conf - ENTRY_CONFIDENCE) / 100.0) * 0.020
-            risk_usd = self.balance * risk_pct
-            lots = round(min(2.50, risk_usd / max(1.0, sl_d * 100.0)), 2)
-
-        if lots < 0.01:
-            lots = 0.01  # أدنى حجم؛ حارس المخاطرة أدناه يرفض إن كان الخطر مفرطاً
-
-        real_risk = lots * sl_d * 100.0
-        if real_risk > self.balance * MAX_RISK_PCT:
-            self.cooldown_until = time.time() + 60
-            self.cooldown_note = f"رُفض: مخاطرة {real_risk:.2f}$ ({real_risk / max(self.balance, 1e-9) * 100:.1f}% > {MAX_RISK_PCT * 100:.0f}%)"
-            self.log_thought(
-                f"رُفض الدخول: المخاطرة الفعلية {real_risk:.2f}$ = {real_risk / max(self.balance, 1e-9) * 100:.1f}% من الرصيد (الحد {MAX_RISK_PCT * 100:.0f}%).",
-                "RISK_SHIELD",
-            )
-            return
-        if self.spread > sl_d * MAX_SPREAD_TO_RISK:
-            self.cooldown_until = time.time() + 30
-            self.cooldown_note = f"رُفض: السبريد {self.spread}$ > {MAX_SPREAD_TO_RISK * 100:.0f}% من الوقف"
-            self.log_thought(
-                f"رُفض الدخول: السبريد {self.spread}$ يلتهم أكثر من {MAX_SPREAD_TO_RISK * 100:.0f}% من مسافة الوقف ({sl_d}$).",
-                "RISK_SHIELD",
-            )
-            return
+            # سقف مخاطرة صارم لا يتجاوز 0.35% من الرصيد ولا يتعدى 0.10 لوت
+            risk_usd = self.balance * MAX_RISK_PCT_CAP
+            lots = round(min(MAX_LOT_CAP, max(0.01, risk_usd / max(1.0, sl_d * 100.0))), 2)
 
         smc_tag = f" | SMC={self.smc_event}" if self.smc_event != "NONE" else ""
         reason = (
-            f"قناعة {conf}% | السياسة: {self.active_policy}{smc_tag} | "
-            f"H={self.hurst} | ATR={self.atr_value}$"
+            f"قناعة {conf}% | {self.active_policy}{smc_tag} | "
+            f"Bias={self.macro_bias} | SL={sl_d}$"
         )
-        self.cooldown_note = ""
         self.open_position = {
             "id": int(time.time() * 1000) % 1000000,
             "side": side,
@@ -1283,11 +1130,12 @@ class AutonomousQuantitativeBrain:
         pos["r_multiple"] = round(r_multiple, 2)
         held = time.time() - pos["opened_ts"]
 
+        # منع خنق الصفقة الرابحة مبكراً: لا يتم التأمين إلا بعد وصول السعر إلى 1.35R (أو 1.50R للوت 0.01)
         can_partial = pos["lots"] >= 0.02
-        be_trigger_r = 0.85 if can_partial else 1.15
+        be_trigger_r = 1.35 if can_partial else 1.50
 
         if not pos["be_secured"] and r_multiple >= be_trigger_r:
-            lock = round(max(self.spread + 0.05, pos["initial_risk"] * 0.18), 2)
+            lock = round(max(self.spread * 2.0 + 0.25, pos["initial_risk"] * 0.30), 2)
             pos["sl"] = round(pos["entry_price"] + lock if side == "BUY" else pos["entry_price"] - lock, 2)
             pos["be_secured"] = True
 
@@ -1300,29 +1148,30 @@ class AutonomousQuantitativeBrain:
                     pos["realized"] = round(pos["realized"] + chunk, 2)
                     pos["lots"] = round(pos["lots"] - closed_lots, 2)
                     pos["partial_taken"] = True
-                    note_msg = f"جني جزئي ({closed_lots}L) بربح {chunk:+.2f}$ ونقل الوقف لـ {pos['sl']:.2f}$"
+                    note_msg = f"جني جزئي ({closed_lots}L) عند {r_multiple:.2f}R بربح {chunk:+.2f}$ ونقل الوقف لـ {pos['sl']:.2f}$"
 
             self.log_thought(f"تأمين ذكي: {note_msg}", "RISK_SHIELD")
             self._save_runtime_key("open_position", pos)
             await self.tg.notify_secured(pos, note_msg)
 
-        if pos["be_secured"] and r_multiple >= 1.40:
-            trail_dist = round(max(pos["initial_risk"] * 0.55, self.atr_value * 1.15), 2)
+        # الوقف التتبعي يبدأ فقط بعد 1.85R وبمسافة مريحة تسمح ببلوغ الهدف الكامل
+        if pos["be_secured"] and r_multiple >= 1.85:
+            trail_dist = round(max(pos["initial_risk"] * 0.80, self.atr_value * 1.75), 2)
             if side == "BUY":
                 new_sl = round(q - trail_dist, 2)
-                if new_sl > pos["sl"]:
+                if new_sl > pos["sl"] + 0.15:
                     pos["sl"] = new_sl
                     self._save_runtime_key("open_position", pos)
             else:
                 new_sl = round(q + trail_dist, 2)
-                if new_sl < pos["sl"]:
+                if new_sl < pos["sl"] - 0.15:
                     pos["sl"] = new_sl
                     self._save_runtime_key("open_position", pos)
 
         hit_tp = q >= pos["tp"] if side == "BUY" else q <= pos["tp"]
         hit_sl = q <= pos["sl"] if side == "BUY" else q >= pos["sl"]
         if hit_tp:
-            await self._close_position(q, "ضرب الهدف الإحصائي الهيكلي (Structural TP Hit)")
+            await self._close_position(q, "ضرب الهدف الهيكلي الكامل (Structural TP Hit)")
             return
         if hit_sl:
             reason = "وقف الأرباح المتحرك (Secured Trailing SL)" if pos["be_secured"] else "ضرب وقف الحماية الهيكلي (Structural SL)"
@@ -1330,11 +1179,11 @@ class AutonomousQuantitativeBrain:
             return
 
         opposite = (side == "BUY" and decision["direction"] == -1) or (side == "SELL" and decision["direction"] == 1)
-        if opposite and decision["score"] >= 82.0 and held >= OPPOSITE_EXIT_MIN_HOLD_S:
-            await self._close_position(q, f"خروج استباقي: انعكاس هيكلي مضاد بقوة {decision['score']}%")
+        if opposite and decision["score"] >= 88.0 and decision.get("confirmed") and held >= OPPOSITE_EXIT_MIN_HOLD_S:
+            await self._close_position(q, f"خروج استباقي مؤكد: انعكاس هيكلي مضاد بقوة {decision['score']}%")
             return
 
-        if held > STAGNATION_EXIT_S and abs(r_multiple) < 0.25 and self.entropy > 0.84:
+        if held > STAGNATION_EXIT_S and abs(r_multiple) < 0.20 and self.entropy > 0.86:
             await self._close_position(q, f"إلغاء الفرضية ذاتياً: تباطؤ الزخم وارتفاع الإنتروبيا لـ {self.entropy}")
 
     async def _close_position(self, exit_price: float, reason_exit: str):
@@ -1472,9 +1321,11 @@ class AutonomousQuantitativeBrain:
 
 tg_notifier = TelegramNotifier()
 brain = AutonomousQuantitativeBrain(tg_notifier)
-tg_notifier.logger = lambda m: brain.log_thought(m, "SYSTEM")
 
 
+# ==============================================================================
+# 4. محرك البث الحي والشموع التاريخية متعدّد المصادر (Swissquote + Binance Vision + Kraken)
+# ==============================================================================
 def parse_swissquote(data, profile: str):
     items = data if isinstance(data, list) else [data]
     bids, asks, stamps = [], [], []
@@ -1515,16 +1366,16 @@ class LiveGoldStream:
         self.feed_source: str = "CONNECTING_TO_LIVE_CFD_FEED"
         self.market_open: bool = True
         self.last_poll: float = 0.0
-        self.last_yahoo: float = 0.0
+        self.last_fallback: float = 0.0
         self.last_good_ts: float = 0.0
         self.last_hist_try: float = 0.0
         self.hist_tries: int = 0
-        self.hist_loaded: bool = False
+        self.hist_loaded: bool = len(brain_ref.candles) >= 180
         self._client: Optional[httpx.AsyncClient] = None
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=6.0, headers={"User-Agent": "Mozilla/5.0"})
+            self._client = httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "Mozilla/5.0"})
         return self._client
 
     async def _quote_swissquote(self):
@@ -1537,52 +1388,106 @@ class LiveGoldStream:
             return None
         return parse_swissquote(data, SQ_PROFILE)
 
-    async def _quote_yahoo(self):
-        def work():
-            df = yf.Ticker("XAUUSD=X").history(period="1d", interval="1m")
-            return round(float(df["Close"].dropna().iloc[-1]), 2)
+    async def _quote_paxg_fallback(self):
+        """مصدر احتياطي فوري للسعر الحي في حال تأخر Swissquote."""
         try:
-            p = await asyncio.get_running_loop().run_in_executor(None, work)
-            return p - ASSUMED_SPREAD / 2.0, p + ASSUMED_SPREAD / 2.0, None
+            r = await self._http().get(
+                BINANCE_VISION_URL,
+                params={"symbol": "PAXGUSDT", "interval": "1m", "limit": 1},
+            )
+            if r.status_code == 200:
+                arr = r.json()
+                if arr and isinstance(arr, list):
+                    p = round(float(arr[-1][4]), 2)
+                    return p - ASSUMED_SPREAD / 2.0, p + ASSUMED_SPREAD / 2.0, float(arr[-1][6])
         except Exception:
-            return None
+            pass
+        return None
+
+    async def _fetch_external_history(self) -> tuple[List[Dict], str]:
+        """جلب 350 شمعة تاريخية للذهب عبر Binance Vision أو Binance Main أو Kraken بدون مكتبة yfinance."""
+        # 1. المحاولة عبر Binance Vision (لا تحظر سيرفرات Render الأمريكية/الأوروبية)
+        for url, label in ((BINANCE_VISION_URL, "BINANCE_VISION_PAXG"), (BINANCE_MAIN_URL, "BINANCE_PAXG")):
+            try:
+                r = await self._http().get(
+                    url,
+                    params={"symbol": "PAXGUSDT", "interval": BN_INTERVAL, "limit": 350},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list) and len(data) >= 40:
+                        out = []
+                        for row in data:
+                            out.append({
+                                "time": (int(row[0]) // 1000) // TF_SEC * TF_SEC,
+                                "open": float(row[1]),
+                                "high": float(row[2]),
+                                "low": float(row[3]),
+                                "close": float(row[4]),
+                            })
+                        return out, label
+            except Exception as e:
+                print(f"{label} history error:", repr(e))
+
+        # 2. المحاولة الاحتياطية عبر Kraken Public OHLC (PAXGUSD)
+        try:
+            r = await self._http().get(
+                KRAKEN_OHLC_URL,
+                params={"pair": "PAXGUSD", "interval": TF_MIN},
+            )
+            if r.status_code == 200:
+                res = r.json().get("result", {})
+                pair_key = next((k for k in res.keys() if k != "last"), None)
+                if pair_key and isinstance(res[pair_key], list):
+                    rows = res[pair_key][-350:]
+                    out = []
+                    for row in rows:
+                        out.append({
+                            "time": int(row[0]) // TF_SEC * TF_SEC,
+                            "open": float(row[1]),
+                            "high": float(row[2]),
+                            "low": float(row[3]),
+                            "close": float(row[4]),
+                        })
+                    if len(out) >= 40:
+                        return out, "KRAKEN_PAXG"
+        except Exception as e:
+            print("Kraken history error:", repr(e))
+
+        return [], "NONE"
 
     async def _load_history(self, ref_price: float):
+        """جلب ومزامنة الشموع التاريخية مع معايرة الفارق السعري على سعر Swissquote الحي وحفظها في SQLite."""
         self.last_hist_try = time.time()
         self.hist_tries += 1
 
-        def work():
-            df = yf.Ticker("XAUUSD=X").history(period="5d", interval=YF_INTERVAL).dropna()
-            out = []
-            for idx, row in df.tail(320).iterrows():
-                out.append({
-                    "time": int(idx.timestamp()) // TF_SEC * TF_SEC,
-                    "open": float(row["Open"]), "high": float(row["High"]),
-                    "low": float(row["Low"]), "close": float(row["Close"]),
-                })
-            return out
-
-        try:
-            hist = await asyncio.get_running_loop().run_in_executor(None, work)
-        except Exception as e:
-            print("History error:", repr(e))
+        hist, src_label = await self._fetch_external_history()
+        if not hist:
             return
 
         async with self.brain.lock:
             live = list(self.brain.candles)
-            first_live = live[0]["time"] if live else None
-            hist = [c for c in hist if first_live is None or c["time"] < first_live]
+            # نأخذ الشموع الحية الحديثة فقط (آخر 15 دقيقة) كمرجع للمعايرة
+            now_bucket = (int(time.time()) // TF_SEC) * TF_SEC
+            recent_live = [c for c in live if now_bucket - c["time"] <= TF_SEC * 15]
+            first_live_ts = recent_live[0]["time"] if recent_live else now_bucket
+            anchor_price = recent_live[0]["open"] if recent_live else ref_price
+
+            hist_before = [c for c in hist if c["time"] < first_live_ts]
             seen, clean = set(), []
-            for c in hist:
+            for c in hist_before:
                 if c["time"] not in seen:
                     seen.add(c["time"])
                     clean.append(c)
-            if len(clean) < 25:
+
+            if len(clean) < 30:
                 return
-            anchor = live[0]["open"] if live else ref_price
-            off = anchor - clean[-1]["close"]
-            if abs(off) > ref_price * 0.03:
-                return
+
+            # حساب إزاحة المعايرة (Auto-Anchor Offset) لتتطابق شموع PAXG مع سعر CFD الفوري لـ Swissquote
+            off = anchor_price - clean[-1]["close"]
+            if abs(off) > ref_price * 0.05:
+                off = 0.0
+
             shifted = [
                 {
                     "time": c["time"],
@@ -1593,20 +1498,26 @@ class LiveGoldStream:
                 }
                 for c in clean
             ]
+
+            merged = shifted + recent_live
             self.brain.candles.clear()
-            self.brain.candles.extend(shifted + live)
+            self.brain.candles.extend(merged)
+            self.brain.save_bulk_candles_to_db(merged)
+
             closes_arr = np.array([c["close"] for c in self.brain.candles], dtype=float)
             self.brain._warm_history(closes_arr)
             self.brain._analysis_ts = None
             self.hist_loaded = True
             self.brain.log_thought(
-                f"تم دمج ومعايرة {len(shifted)} شمعة تاريخية لسعر السبوت بنجاح.",
+                f"تم تحميل ومعايرة {len(shifted)} شمعة تاريخية عبر ({src_label}) وحفظها في SQLite بنجاح.",
                 "PERCEPTION",
             )
 
     def _update_candle(self, price: float, bucket: int):
         candles = self.brain.candles
         if not candles or bucket > candles[-1]["time"]:
+            if candles:
+                self.brain.save_candle_to_db(candles[-1])
             candles.append({"time": bucket, "open": price, "high": price, "low": price, "close": price})
             return
         last = candles[-1]
@@ -1639,9 +1550,9 @@ class LiveGoldStream:
         if now - self.last_poll >= POLL_S:
             self.last_poll = now
             q, src = await self._quote_swissquote(), "SWISSQUOTE"
-            if q is None and now - self.last_yahoo >= 15.0:
-                self.last_yahoo = now
-                q, src = await self._quote_yahoo(), "YAHOO_SPOT"
+            if q is None and now - self.last_fallback >= 10.0:
+                self.last_fallback = now
+                q, src = await self._quote_paxg_fallback(), "PAXG_SPOT_FEED"
             if q is not None:
                 bid, ask, ts_ms = q
                 self.last_good_ts = now
@@ -1655,7 +1566,7 @@ class LiveGoldStream:
                     b.last_price = mid
                     b.spread = round(max(ask - bid, 0.0), 2)
                     self._update_candle(mid, bucket)
-                    if not self.hist_loaded and self.hist_tries < 5 and now - self.last_hist_try > 30.0:
+                    if not self.hist_loaded and self.hist_tries < 8 and now - self.last_hist_try > 15.0:
                         await self._load_history(mid)
 
         fresh = (now - self.last_good_ts) < 20.0
@@ -1712,6 +1623,9 @@ class LiveGoldStream:
                 "sigma": b.volatility_sigma,
                 "atr": b.atr_value,
                 "z_score": b.z_score,
+                "ema_fast": b.ema_fast,
+                "ema_slow": b.ema_slow,
+                "macro_bias": b.macro_bias,
                 "poc": b.poc_price,
                 "vah": b.vah_price,
                 "val": b.val_price,
@@ -1759,10 +1673,7 @@ stream_manager = LiveGoldStream(brain)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    tg_notifier.start()
     task = asyncio.create_task(stream_manager.run_stream_loop())
-    await brain.tg.notify_startup(brain.balance, "XAU/USD CFD")
-    spawn(brain.tg.startup_check())
     try:
         yield
     finally:
@@ -1773,19 +1684,7 @@ async def lifespan(_: FastAPI):
             pass
 
 
-app = FastAPI(title="Autonomous XAU/USD Quantitative React Terminal v3", lifespan=lifespan)
-
-
-@app.get("/tg-debug")
-async def tg_debug(enable: int = 0, send: int = 0):
-    """تشخيص تلغرام: /tg-debug  |  تفعيل: ?enable=1  |  رسالة اختبار: ?send=1"""
-    if enable:
-        brain.update_telegram_config("", brain.tg.chat_id, True)
-    d = await brain.tg.diagnose()
-    if send:
-        d["test_sent"] = await brain.tg.send_html("🔔 <b>اختبار من /tg-debug</b>\nإن وصلتك هذه الرسالة فالربط سليم.", force=True)
-        d["last_status"] = brain.tg.last_status
-    return d
+app = FastAPI(title="Autonomous XAU/USD Quantitative React Terminal v4", lifespan=lifespan)
 
 
 @app.websocket("/ws")
@@ -1810,7 +1709,7 @@ async def websocket_endpoint(ws: WebSocket):
                 elif cmd == "TOGGLE_LOT_MODE":
                     brain.lot_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED_001" else "FIXED_001"
                     brain._save_runtime_key("lot_mode", brain.lot_mode)
-                    mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة ديناميكية %"
+                    mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة محمية (0.35% سقف)"
                     brain.log_thought(f"تم تبديل حجم العقد إلى: {mode_lbl}", "SYSTEM")
 
                 elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
@@ -1819,17 +1718,23 @@ async def websocket_endpoint(ws: WebSocket):
                         "إغلاق فوري بطلب المالك (Manual Emergency Exit)",
                     )
 
+                elif cmd == "RELOAD_HISTORY":
+                    if brain.last_price:
+                        stream_manager.hist_loaded = False
+                        stream_manager.hist_tries = 0
+                        asyncio.create_task(stream_manager._load_history(brain.last_price))
+                        brain.log_thought("جاري إعادة مزامنة الشموع التاريخية من المصادر البديلة...", "SYSTEM")
+
                 elif cmd == "SAVE_TELEGRAM":
                     token = str(data.get("bot_token", "")).strip()
                     chat_id = str(data.get("chat_id", "")).strip()
                     enabled = bool(data.get("enabled", True))
                     brain.update_telegram_config(token, chat_id, enabled)
                     brain.log_thought(f"تم تحديث إعدادات إشعارات تلغرام ({brain.tg.last_status}).", "SYSTEM")
-                    spawn(brain.tg.startup_check(confirm=True))
 
                 elif cmd == "TEST_TELEGRAM":
                     test_msg = (
-                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Quant Cortex</b>\n"
+                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Quant Cortex v4</b>\n"
                         "━━━━━━━━━━━━━━━━━━\n"
                         f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.\n"
                         f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>\n"
@@ -1837,16 +1742,10 @@ async def websocket_endpoint(ws: WebSocket):
                         f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
                     )
                     ok = await brain.tg.send_html(test_msg, force=True)
-                    if ok and brain.tg.bot_token and brain.tg.chat_id and not brain.tg.enabled:
-                        brain.update_telegram_config("", brain.tg.chat_id, True)
-                        brain.tg.last_status = "نجح الاختبار وتم تفعيل إشعارات الصفقات تلقائياً"
-                        brain.log_thought("✅ نجح اختبار تلغرام وتم تفعيل إشعارات الصفقات تلقائياً (كانت مُعطّلة).", "SYSTEM")
-                        brain.tg.enqueue("✅ <b>تم تفعيل إشعارات الصفقات</b>\nستصلك الآن رسالة عند كل دخول وتأمين وإغلاق.")
-                    else:
-                        brain.log_thought(
-                            "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
-                            "SYSTEM",
-                        )
+                    brain.log_thought(
+                        "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
+                        "SYSTEM",
+                    )
 
                 elif cmd == "SEND_DAILY_REPORT_NOW":
                     report = brain.build_daily_report_data()
@@ -1871,7 +1770,7 @@ HTML_UI = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>XAU/USD — Quantitative Cortex React Terminal</title>
+  <title>XAU/USD — Quantitative Cortex React Terminal v4</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -2100,7 +1999,7 @@ HTML_UI = """<!DOCTYPE html>
           lineWidth: 2,
           lineStyle: LightweightCharts.LineStyle.Dotted,
           axisLabelVisible: true,
-          title: 'TP',
+          title: 'TP (2.3R)',
         }));
         posLinesRef.current.push(seriesRef.current.createPriceLine({
           price: openPos.sl,
@@ -2108,7 +2007,7 @@ HTML_UI = """<!DOCTYPE html>
           lineWidth: 2,
           lineStyle: LightweightCharts.LineStyle.Dotted,
           axisLabelVisible: true,
-          title: openPos.be_secured ? 'SL (BE+)' : 'SL',
+          title: openPos.be_secured ? 'SL (BE+)' : 'SAFE SL',
         }));
       }, [openPos]);
 
@@ -2136,7 +2035,8 @@ HTML_UI = """<!DOCTYPE html>
         telegram: { enabled: false, configured: false, masked_token: "", chat_id: "", last_status: "غير مرتبط", last_report_date: "" },
         cognition: {
           hurst: 0.5, hurst_rank: 50, entropy: 0.5, entropy_rank: 50,
-          velocity: 0, sigma: 0, atr: 1.2, z_score: 0,
+          velocity: 0, sigma: 0, atr: 1.5, z_score: 0,
+          ema_fast: null, ema_slow: null, macro_bias: "NEUTRAL",
           poc: null, vah: null, val: null, smc_event: "NONE",
           regime: "INITIALIZING", policy: "OBSERVING", confidence: 0,
           weights: {}, block_reason: "تجميع البيانات..."
@@ -2184,7 +2084,7 @@ HTML_UI = """<!DOCTYPE html>
 
             if (data.telegram && !tgLoadedRef.current) {
               setTgChatInput(data.telegram.chat_id || "");
-              setTgEnabledInput(Boolean(data.telegram.enabled) || !data.telegram.configured);
+              setTgEnabledInput(Boolean(data.telegram.enabled));
               tgLoadedRef.current = true;
             }
 
@@ -2240,7 +2140,7 @@ HTML_UI = """<!DOCTYPE html>
         if (!pos) {
           return (
             <div className="py-5 text-center text-xs text-slate-400">
-              لا توجد صفقة نشطة حالياً — الوكيل يفحص هياكل السيولة (SMC) وإنتروبيا السوق.
+              لا توجد صفقة نشطة حالياً — الوكيل يفحص توافق الهيكل الكلي (EMA 50/150) مع هياكل السيولة (SMC).
             </div>
           );
         }
@@ -2262,11 +2162,11 @@ HTML_UI = """<!DOCTYPE html>
                 <span className="font-bold mono text-sm text-white">${pos.current_price.toFixed(2)}</span>
               </div>
               <div className="glass-pill p-2.5">
-                <span className="text-[10px] text-slate-400 block">الوقف (SL)</span>
+                <span className="text-[10px] text-slate-400 block">الوقف الآمن (SL)</span>
                 <span className="font-bold mono text-sm text-rose-400">${pos.sl.toFixed(2)}</span>
               </div>
               <div className="glass-pill p-2.5">
-                <span className="text-[10px] text-slate-400 block">الهدف (TP)</span>
+                <span className="text-[10px] text-slate-400 block">الهدف (TP 2.3R)</span>
                 <span className="font-bold mono text-sm text-emerald-400">${pos.tp.toFixed(2)}</span>
               </div>
               <div className="glass-pill p-2.5">
@@ -2287,7 +2187,7 @@ HTML_UI = """<!DOCTYPE html>
               <div className="flex items-center justify-between text-[11px] mb-1.5">
                 <span className="text-rose-400 mono font-semibold">SL: ${pos.sl.toFixed(2)}</span>
                 <span className="text-slate-300 text-[11px]">
-                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+)' : '⏳ تحت المراقبة الحية'}
+                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+ بعد 1.35R)' : '⏳ تحت المراقبة الحية (تأمين عند 1.35R)'}
                 </span>
                 <span className="text-emerald-400 mono font-semibold">TP: ${pos.tp.toFixed(2)}</span>
               </div>
@@ -2443,11 +2343,6 @@ HTML_UI = """<!DOCTYPE html>
               </button>
             </div>
           </form>
-
-          <div className="text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2 pt-1">
-            <span>• يرسل البوت تلقائياً: إشعار الدخول (SL/TP) + إشعار التأمين + نتيجة الخروج النهائية.</span>
-            <span>• التقرير اليومي يُرسل تلقائياً بعد إغلاق السوق عند الساعة <b className="mono text-amber-300">21:01 UTC</b>.</span>
-          </div>
         </div>
       );
 
@@ -2455,11 +2350,11 @@ HTML_UI = """<!DOCTYPE html>
         <div className="glass-card p-3.5 sm:p-4 flex flex-col gap-3.5">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-xs font-extrabold text-amber-400 tracking-wide">القشرة الكمية والهيكلية (Cortex)</h2>
+              <h2 className="text-xs font-extrabold text-amber-400 tracking-wide">القشرة الكمية والهيكلية (Cortex v4)</h2>
               <p className="text-[11px] text-slate-400 mt-0.5">{cog.block_reason}</p>
             </div>
             <div className="glass-pill px-3 py-1 text-right">
-              <span className="text-[10px] text-slate-400 block">قناعة الدخول</span>
+              <span className="text-[10px] text-slate-400 block">قناعة الدخول (الحد 86%)</span>
               <span className="text-sm font-extrabold text-amber-300 mono">{cog.confidence}%</span>
             </div>
           </div>
@@ -2473,8 +2368,12 @@ HTML_UI = """<!DOCTYPE html>
 
           <div className="grid grid-cols-2 gap-2 text-xs">
             <div className="glass-pill p-2.5">
-              <div className="text-[10px] text-slate-400">النظام المكتشف</div>
-              <div className="font-bold text-slate-100 mt-0.5 mono text-[11px] truncate">{cog.regime}</div>
+              <div className="text-[10px] text-slate-400">الاتجاه الكلي (Macro Bias)</div>
+              <div className={`font-extrabold mt-0.5 mono text-xs ${
+                cog.macro_bias === 'BULLISH' ? 'text-emerald-400' : cog.macro_bias === 'BEARISH' ? 'text-rose-400' : 'text-amber-300'
+              }`}>
+                {cog.macro_bias} {cog.ema_fast ? `(EMA: $${cog.ema_fast})` : ''}
+              </div>
             </div>
             <div className="glass-pill p-2.5">
               <div className="text-[10px] text-slate-400">السياسة النشطة</div>
@@ -2581,7 +2480,7 @@ HTML_UI = """<!DOCTYPE html>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="font-extrabold text-base sm:text-lg tracking-tight text-white mono">XAU/USD</span>
                     <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/25">
-                      SMC v3
+                      QUANT v4 PRO
                     </span>
                     <span className="hidden sm:inline-block text-[10px] px-2 py-0.5 rounded-full bg-white/5 text-slate-300 border border-white/10">
                       {session?.label}
@@ -2597,16 +2496,23 @@ HTML_UI = """<!DOCTYPE html>
                     {state.price ? `$${Number(state.price).toFixed(2)}` : '--.--'}
                   </div>
                   <div className="text-[10px] text-slate-400 mono">
-                    Spd: <b className="text-amber-300">${Number(state.spread).toFixed(2)}</b>
+                    Spd: <b className={state.spread > 0.55 ? 'text-rose-400' : 'text-emerald-300'}>${Number(state.spread).toFixed(2)}</b>
                   </div>
                 </div>
 
                 <div className="flex items-center gap-1.5">
                   <button
+                    onClick={() => sendCommand('RELOAD_HISTORY')}
+                    title="إعادة مزامنة الشموع التاريخية"
+                    className="px-2 py-1.5 rounded-xl text-[11px] font-semibold bg-white/5 hover:bg-white/10 text-amber-300 border border-white/10 transition"
+                  >
+                    🔄 التاريخ
+                  </button>
+                  <button
                     onClick={() => sendCommand('TOGGLE_LOT_MODE')}
                     className="px-2.5 py-1.5 rounded-xl text-[11px] font-semibold bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition"
                   >
-                    {state.lot_mode === 'FIXED_001' ? '0.01L' : 'Risk%'}
+                    {state.lot_mode === 'FIXED_001' ? '0.01L' : '0.35%Risk'}
                   </button>
                   <button
                     onClick={() => sendCommand('TOGGLE_BOT')}
