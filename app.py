@@ -45,11 +45,12 @@ MAX_SPREAD = 0.99                # سقف السبريد المسموح للدخ
 ASSUMED_SPREAD = 0.25            # سبريد افتراضي عند غياب الفارق
 ENTRY_CONFIDENCE = 76.0          # عتبة القناعة المبكرة لالتقاط بداية الارتداد (76%)
 SIGNAL_CONFIRM = 1               # تأكيد فوري مع إغلاق أول شمعة حسم من القمة/القاع (بدون تأخير)
-MIN_SL_DISTANCE = 1.40           # حد أدنى منطقي للستوب خلف القمة/القاع ($1.40)
-MAX_SL_DISTANCE = 5.50           # أقصى ستوب هيكلي مسموح؛ إذا كانت القمة أبعد يرفض الدخول المتأخر
-MIN_STRUCTURAL_RR = 1.85         # أقل عائد للمخاطرة مقبول للمحطة الهيكلية المقابلة (1.85R)
-FALLBACK_RR_RATIO = 2.20         # عائد افتراضي في حال عدم وجود جدار مقاومة قريب
-MAX_RISK_PCT_CAP = 0.0035        # سقف المخاطرة في الوضع الديناميكي (0.35%)
+MIN_SL_DISTANCE = 3.00           # حد أدنى منطقي للستوب خلف القمة/القاع ($3.00) لمنع ضرب الستوب بالذبذبة العادية
+MAX_SL_DISTANCE = 8.50           # أقصى ستوب هيكلي مسموح ($8.50) لمنح السعر مساحة للتنفس خلف الهيكل الحقيقي
+MIN_STRUCTURAL_RR = 2.00         # أقل عائد للمخاطرة مقبول للمحطة الهيكلية المقابلة (1:2 = 2.00R)
+MAX_STRUCTURAL_RR = 3.00         # سقف العائد للمخاطرة المستهدف للصفقة (1:3 = 3.00R)
+FALLBACK_RR_RATIO = 3.00         # عائد افتراضي قياسي (1:3 = 3.00R) في حال عدم وجود جدار مقاومة قريب
+MAX_RISK_PCT_CAP = 0.0050        # سقف المخاطرة في الوضع الديناميكي (0.50% = $5 لكل $1000)
 MAX_LOT_CAP = 0.10               # سقف اللوت الأقصى للحماية
 
 COOLDOWN_AFTER_WIN_S = 120 * TF_MIN
@@ -406,7 +407,7 @@ def ml_train_main(argv=None):
     ap.add_argument("--csv"); ap.add_argument("--mt5", action="store_true")
     ap.add_argument("--symbol", default="XAUUSD"); ap.add_argument("--tf", default="H1")
     ap.add_argument("--bars", type=int, default=60000)
-    ap.add_argument("--tp", type=float, default=1.5, help="الهدف بوحدات ATR")
+    ap.add_argument("--tp", type=float, default=3.0, help="الهدف بوحدات ATR (1:3)")
     ap.add_argument("--sl", type=float, default=1.0, help="الوقف بوحدات ATR")
     ap.add_argument("--horizon", type=int, default=24, help="أقصى مدة للصفقة (بالشموع)")
     ap.add_argument("--spread", type=float, default=0.30, help="تكلفة الصفقة بالدولار لكل أونصة (سبريد+عمولة)")
@@ -710,10 +711,10 @@ class AutonomousQuantitativeBrain:
         self.bot_active: bool = True
         self.can_trade: bool = False
         self.lot_mode: str = "FIXED_001"
-        self.balance: float = 100.0
-        self.equity: float = 100.0
-        self.initial_balance: float = 100.0
-        self.peak_balance: float = 100.0
+        self.balance: float = 1000.0
+        self.equity: float = 1000.0
+        self.initial_balance: float = 1000.0
+        self.peak_balance: float = 1000.0
         self.max_drawdown_pct: float = 0.0
 
         self.candles: deque = deque(maxlen=400)
@@ -1524,34 +1525,40 @@ class AutonomousQuantitativeBrain:
         self, side: str, entry: float, decision: Dict
     ) -> Optional[tuple[float, float, float, str, float]]:
         """
-        حساب الستوب لوز (SL) والهدف (TP) من هيكل السوق الحقيقي 100%:
-        - الستوب يوضع خلف القمة السابقة أو القاع السابق مباشرة (+ هامش السبريد و 0.35 ATR).
-        - الهدف يوضع عند المحطة الهيكلية المقابلة في السوق (POC / VAH / VAL / KDE Zone / Opposite Swing)
-          بشرط أن تمنح عائداً للمخاطرة >= 1.85R لتعويض أي ستوب سابق.
+        حساب الستوب لوز (SL) والهدف (TP) من هيكل السوق الحقيقي 100% مع مساحة تنفس كافية:
+        - الستوب يوضع خلف القمة الهيكلية أو القاع الهيكلي الفعلي (آخر 25 شمعة + Swing Anchor)
+          مع هامش أمان واسع (Spread + max(0.80$, 0.85 * ATR)) وبحد أدنى محمي (MIN_SL_DISTANCE = $3.00).
+        - الهدف يُضبط بين 1:2 (2.0R) و 1:3 (3.0R) بناءً على المحطات الهيكلية المقابلة.
         """
+        closed = list(self.candles)[:-1]
+        recent_25 = closed[-25:] if len(closed) >= 25 else closed
+        atr = max(1.0, self.atr_value)
+        min_sl_req = round(max(MIN_SL_DISTANCE, atr * 1.80), 2)
+        buffer = round(self.spread + max(0.80, atr * 0.85), 2)
+
         if decision.get("policy") == "ML_TRIPLE_BARRIER":
-            sl_d, tp_d = round(decision["sl_dist"], 2), round(decision["tp_dist"], 2)
-            rr = round(tp_d / sl_d, 2)
+            sl_d = round(max(min_sl_req, float(decision["sl_dist"])), 2)
+            if sl_d > MAX_SL_DISTANCE:
+                return None
+            raw_rr = float(decision["tp_dist"]) / max(0.1, float(decision["sl_dist"]))
+            rr = round(float(np.clip(raw_rr, MIN_STRUCTURAL_RR, MAX_STRUCTURAL_RR)), 2)
+            tp_d = round(sl_d * rr, 2)
             if side == "BUY":
                 return round(entry - sl_d, 2), round(entry + tp_d, 2), sl_d, "ML_ATR_TARGET", rr
             return round(entry + sl_d, 2), round(entry - tp_d, 2), sl_d, "ML_ATR_TARGET", rr
-        closed = list(self.candles)[:-1]
-        recent_10 = closed[-10:] if len(closed) >= 10 else closed
-        atr = max(0.7, self.atr_value)
-        buffer = round(self.spread + atr * 0.35, 2)
 
         if side == "BUY":
-            # تحديد القاع الفعلي الذي ارتد منه السعر (أدنى ذيل في موجة الارتداد أو القاع الهيكلي القريب)
-            local_low = min(c["low"] for c in recent_10) if recent_10 else entry - atr * 1.5
+            # تحديد القاع الهيكلي الفعلي الذي ارتد منه السعر (من آخر 25 شمعة + أقرب قاع فركتلي)
+            local_low = min(c["low"] for c in recent_25) if recent_25 else entry - atr * 2.2
             trig_low = float(decision.get("trigger_low", local_low))
             anchor_low = min(local_low, trig_low)
-            if self.nearest_swing_low is not None and abs(entry - self.nearest_swing_low) <= atr * 2.2:
+            if self.nearest_swing_low is not None and abs(entry - self.nearest_swing_low) <= atr * 3.5:
                 anchor_low = min(anchor_low, self.nearest_swing_low)
 
             raw_sl = round(anchor_low - buffer, 2)
             sl_d = round(entry - raw_sl, 2)
-            if sl_d < MIN_SL_DISTANCE:
-                sl_d = MIN_SL_DISTANCE
+            if sl_d < min_sl_req:
+                sl_d = min_sl_req
                 raw_sl = round(entry - sl_d, 2)
 
             # إذا كانت المسافة للقاع السابق أكبر من الحد الأقصى المسموح، نرفض الدخول المتأخر!
@@ -1563,7 +1570,7 @@ class AutonomousQuantitativeBrain:
                 self.cooldown_until = time.time() + 45
                 return None
 
-            # البحث في هيكل السوق العلوي عن أفضل محطة هدف (TP) تحقق >= 1.85R
+            # البحث في هيكل السوق العلوي عن أفضل محطة هدف (TP) تقع ضمن نطاق 1:2 إلى 1:3 (2.0R - 3.0R)
             candidates = []
             if self.poc_price and self.poc_price > entry:
                 candidates.append((self.poc_price - 0.15, "VP_POC"))
@@ -1579,12 +1586,12 @@ class AutonomousQuantitativeBrain:
             valid_targets = [
                 (round(tp_p, 2), lbl, round((tp_p - entry) / sl_d, 2))
                 for tp_p, lbl in candidates
-                if (tp_p - entry) >= sl_d * MIN_STRUCTURAL_RR and (tp_p - entry) <= sl_d * 4.2
+                if (tp_p - entry) >= sl_d * MIN_STRUCTURAL_RR and (tp_p - entry) <= sl_d * MAX_STRUCTURAL_RR
             ]
 
             if valid_targets:
-                # نختار أول محطة هيكلية محققة لشرط العائد المضاعف (>= 1.85R) لضمان دقة الضرب قبل الارتداد
-                valid_targets.sort(key=lambda x: x[0])
+                # نختار المحطة الهيكلية الأبعد ضمن نطاق (2.0R إلى 3.0R) لتعظيم العائد نحو 1:3
+                valid_targets.sort(key=lambda x: x[0], reverse=True)
                 tp_price, tp_label, rr_val = valid_targets[0]
             else:
                 tp_d = round(sl_d * FALLBACK_RR_RATIO, 2)
@@ -1595,17 +1602,17 @@ class AutonomousQuantitativeBrain:
             return raw_sl, tp_price, sl_d, tp_label, rr_val
 
         else:
-            # تحديد القمة الفعلية التي ارتد منها السعر في البيع (SELL)
-            local_high = max(c["high"] for c in recent_10) if recent_10 else entry + atr * 1.5
+            # تحديد القمة الهيكلية الفعلية التي ارتد منها السعر في البيع (SELL)
+            local_high = max(c["high"] for c in recent_25) if recent_25 else entry + atr * 2.2
             trig_high = float(decision.get("trigger_high", local_high))
             anchor_high = max(local_high, trig_high)
-            if self.nearest_swing_high is not None and abs(self.nearest_swing_high - entry) <= atr * 2.2:
+            if self.nearest_swing_high is not None and abs(self.nearest_swing_high - entry) <= atr * 3.5:
                 anchor_high = max(anchor_high, self.nearest_swing_high)
 
             raw_sl = round(anchor_high + buffer, 2)
             sl_d = round(raw_sl - entry, 2)
-            if sl_d < MIN_SL_DISTANCE:
-                sl_d = MIN_SL_DISTANCE
+            if sl_d < min_sl_req:
+                sl_d = min_sl_req
                 raw_sl = round(entry + sl_d, 2)
 
             if sl_d > MAX_SL_DISTANCE:
@@ -1631,11 +1638,11 @@ class AutonomousQuantitativeBrain:
             valid_targets = [
                 (round(tp_p, 2), lbl, round((entry - tp_p) / sl_d, 2))
                 for tp_p, lbl in candidates
-                if (entry - tp_p) >= sl_d * MIN_STRUCTURAL_RR and (entry - tp_p) <= sl_d * 4.2
+                if (entry - tp_p) >= sl_d * MIN_STRUCTURAL_RR and (entry - tp_p) <= sl_d * MAX_STRUCTURAL_RR
             ]
 
             if valid_targets:
-                valid_targets.sort(key=lambda x: x[0], reverse=True)
+                valid_targets.sort(key=lambda x: x[0])
                 tp_price, tp_label, rr_val = valid_targets[0]
             else:
                 tp_d = round(sl_d * FALLBACK_RR_RATIO, 2)
@@ -1724,10 +1731,10 @@ class AutonomousQuantitativeBrain:
         total_tp_dist = max(0.5, abs(pos["tp"] - pos["entry_price"]))
         tp_progress = diff / total_tp_dist
 
-        # تأمين الصفقة (Break-Even+) عند قطع 55% من المسافة نحو الهدف الهيكلي أو بلوغ 1.20R
+        # تأمين الصفقة (Break-Even+) عند قطع 65% من المسافة نحو الهدف الهيكلي أو بلوغ 1.50R لإعطاء السعر حرية التذبذب
         can_partial = pos["lots"] >= 0.02
-        if not pos["be_secured"] and (tp_progress >= 0.55 or r_multiple >= 1.20):
-            lock = round(max(self.spread * 1.6 + 0.15, pos["initial_risk"] * 0.25), 2)
+        if not pos["be_secured"] and (tp_progress >= 0.65 or r_multiple >= 1.50):
+            lock = round(max(self.spread * 1.6 + 0.20, pos["initial_risk"] * 0.20), 2)
             pos["sl"] = round(pos["entry_price"] + lock if side == "BUY" else pos["entry_price"] - lock, 2)
             pos["be_secured"] = True
 
@@ -1746,17 +1753,17 @@ class AutonomousQuantitativeBrain:
             self._save_runtime_key("open_position", pos)
             await self.tg.notify_secured(pos, note_msg)
 
-        # الوقف التتبعي الهيكلي بعد قطع 75% من المسافة نحو الهدف
-        if pos["be_secured"] and (tp_progress >= 0.75 or r_multiple >= 1.65):
-            trail_dist = round(max(pos["initial_risk"] * 0.65, self.atr_value * 1.45), 2)
+        # الوقف التتبعي الهيكلي بعد قطع 80% من المسافة نحو الهدف أو بلوغ 2.00R بمسافة تتبع مريحة
+        if pos["be_secured"] and (tp_progress >= 0.80 or r_multiple >= 2.00):
+            trail_dist = round(max(pos["initial_risk"] * 0.75, self.atr_value * 1.80), 2)
             if side == "BUY":
                 new_sl = round(q - trail_dist, 2)
-                if new_sl > pos["sl"] + 0.10:
+                if new_sl > pos["sl"] + 0.15:
                     pos["sl"] = new_sl
                     self._save_runtime_key("open_position", pos)
             else:
                 new_sl = round(q + trail_dist, 2)
-                if new_sl < pos["sl"] - 0.10:
+                if new_sl < pos["sl"] - 0.15:
                     pos["sl"] = new_sl
                     self._save_runtime_key("open_position", pos)
 
@@ -2304,7 +2311,7 @@ async def websocket_endpoint(ws: WebSocket):
                 elif cmd == "TOGGLE_LOT_MODE":
                     brain.lot_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED_001" else "FIXED_001"
                     brain._save_runtime_key("lot_mode", brain.lot_mode)
-                    mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة محمية (0.35% سقف)"
+                    mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة محمية (0.50% سقف)"
                     brain.log_thought(f"تم تبديل حجم العقد إلى: {mode_lbl}", "SYSTEM")
 
                 elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
@@ -2447,7 +2454,7 @@ HTML_UI = """<!DOCTYPE html>
     function EquitySparkline({ initialBalance, currentEquity, tradeLog }) {
       const points = useMemo(() => {
         const logs = [...(tradeLog || [])].reverse();
-        let cur = Number(initialBalance || 100);
+        let cur = Number(initialBalance || 1000);
         const vals = [cur];
         logs.forEach(t => {
           cur += Number(t.pnl || 0);
@@ -2794,9 +2801,9 @@ HTML_UI = """<!DOCTYPE html>
         ask: null,
         spread: 0.25,
         max_spread: 0.99,
-        balance: 100,
-        equity: 100,
-        initial_balance: 100,
+        balance: 1000,
+        equity: 1000,
+        initial_balance: 1000,
         kpis: { win_rate: 0, total_trades: 0, wins: 0, losses: 0, profit_factor: 0, net_pnl: 0, expectancy: 0, max_drawdown_pct: 0 },
         telegram: { enabled: false, configured: false, masked_token: "", chat_id: "", last_status: "غير مرتبط", last_report_date: "" },
         cognition: {
@@ -3308,7 +3315,7 @@ HTML_UI = """<!DOCTYPE html>
                       onClick={() => sendCommand('TOGGLE_LOT_MODE')}
                       className="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition"
                     >
-                      {state.lot_mode === 'FIXED_001' ? '0.01L' : '0.35%Risk'}
+                      {state.lot_mode === 'FIXED_001' ? '0.01L' : '0.50%Risk'}
                     </button>
                     <button
                       onClick={() => sendCommand('TOGGLE_BOT')}
