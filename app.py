@@ -14,7 +14,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 # ==============================================================================
-# 0. إعدادات قابلة للتعديل ومعايير الحماية المشددة (Configuration & Hyperparameters)
+# 0. إعدادات قابلة للتعديل ومعايير الهيكل السعري (100% Market-Driven Structure)
 # ==============================================================================
 DB_PATH = os.getenv("BOT_DB_PATH", "autonomous_memory.db")
 
@@ -25,7 +25,6 @@ DEFAULT_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SQ_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
 SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()
 
-# مصادر الشموع التاريخية البديلة لـ Yahoo المتوقف (مرآة Binance العالمية + Kraken لـ PAXG المدعوم بالذهب 1:1)
 BINANCE_VISION_URL = "https://data-api.binance.vision/api/v3/klines"
 BINANCE_MAIN_URL = "https://api.binance.com/api/v3/klines"
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
@@ -39,24 +38,25 @@ if TF_MIN not in _BN_INT:
 BN_INTERVAL = _BN_INT[TF_MIN]
 TF_SEC = TF_MIN * 60
 
-# --- معايير الفلترة الصارمة وإدارة المخاطر ---
-MIN_CANDLES = 60                 # أقل عدد شموع قبل بدء التحليل
+# --- معايير القنص الهيكلي المبكر من القمم والقيعان (Early Structural Sniper) ---
+MIN_CANDLES = 55                 # أقل عدد شموع قبل بدء التحليل
 MAX_SPREAD = 0.99                # سقف السبريد المسموح للدخول ($0.99)
 ASSUMED_SPREAD = 0.25            # سبريد افتراضي عند غياب الفارق
-ENTRY_CONFIDENCE = 86.0          # الحد الأدنى للقناعة للدخول (86%)
-SIGNAL_CONFIRM = 2               # تأكيد الإغلاق لشمعتين
-MIN_SL_DISTANCE = 3.20           # أقل مسافة وقف خسارة مسموحة للذهب ($3.20) لمنع ضرب الذيول
-MAX_SL_DISTANCE = 6.50           # أقصى مسافة وقف خسارة افتراضية ($6.50)
-TARGET_RR_RATIO = 2.30           # نسبة العائد للمخاطرة المستهدفة (2.3R)
+ENTRY_CONFIDENCE = 76.0          # عتبة القناعة المبكرة لالتقاط بداية الارتداد (76%)
+SIGNAL_CONFIRM = 1               # تأكيد فوري مع إغلاق أول شمعة حسم من القمة/القاع (بدون تأخير)
+MIN_SL_DISTANCE = 1.40           # حد أدنى منطقي للستوب خلف القمة/القاع ($1.40)
+MAX_SL_DISTANCE = 5.50           # أقصى ستوب هيكلي مسموح؛ إذا كانت القمة أبعد يرفض الدخول المتأخر
+MIN_STRUCTURAL_RR = 1.85         # أقل عائد للمخاطرة مقبول للمحطة الهيكلية المقابلة (1.85R)
+FALLBACK_RR_RATIO = 2.20         # عائد افتراضي في حال عدم وجود جدار مقاومة قريب
 MAX_RISK_PCT_CAP = 0.0035        # سقف المخاطرة في الوضع الديناميكي (0.35%)
 MAX_LOT_CAP = 0.10               # سقف اللوت الأقصى للحماية
 
-COOLDOWN_AFTER_WIN_S = 180 * TF_MIN
-COOLDOWN_AFTER_LOSS_S = 360 * TF_MIN
+COOLDOWN_AFTER_WIN_S = 120 * TF_MIN
+COOLDOWN_AFTER_LOSS_S = 240 * TF_MIN
 MAX_CONSECUTIVE_LOSSES = 3
-LOSS_STREAK_PAUSE_S = 2400 * TF_MIN
-OPPOSITE_EXIT_MIN_HOLD_S = 240 * TF_MIN
-STAGNATION_EXIT_S = 1200 * TF_MIN
+LOSS_STREAK_PAUSE_S = 1800 * TF_MIN
+OPPOSITE_EXIT_MIN_HOLD_S = 180 * TF_MIN
+STAGNATION_EXIT_S = 900 * TF_MIN
 
 
 def stamp() -> str:
@@ -68,20 +68,20 @@ def today_utc_str() -> str:
 
 
 def get_active_session() -> Dict[str, str]:
-    """تحديد جلسة التداول الحالية وحظر التداول في الساعة الميتة نهاية نيويورك وفترة الـ Rollover."""
+    """تحديد جلسة التداول الحالية وحظر التداول في فترة توقف السيولة اليومي (Rollover)."""
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour + now_utc.minute / 60.0
-    if 20.0 <= h < 22.25:
+    if 20.5 <= h < 22.15:
         return {
             "name": "DEADZONE_ROLLOVER",
-            "label": "حظر السيولة المسائي والـ Rollover (20:00-22:15 UTC)",
+            "label": "حظر الـ Rollover اليومي (20:30-22:10 UTC)",
             "bias": "HOLD",
         }
     if 13.0 <= h < 17.0:
         return {"name": "LDN_NY_OVERLAP", "label": "تداخل لندن ونيويورك (ذروة السيولة)", "bias": "MOMENTUM"}
     if 7.0 <= h < 13.0:
         return {"name": "LONDON_SESSION", "label": "جلسة لندن (اندفاع سعري)", "bias": "MOMENTUM"}
-    if 17.0 <= h < 20.0:
+    if 17.0 <= h < 20.5:
         return {"name": "NEWYORK_SESSION", "label": "جلسة نيويورك", "bias": "NEUTRAL"}
     return {"name": "ASIAN_SESSION", "label": "الجلسة الآسيوية (ارتداد للمتوسط)", "bias": "REVERSION"}
 
@@ -221,19 +221,19 @@ class TelegramNotifier:
         if not self.is_configured():
             return
         icon = "🟢" if pos["side"] == "BUY" else "🔴"
-        direction_ar = "شراء (BUY)" if pos["side"] == "BUY" else "بيع (SELL)"
+        direction_ar = "شراء هيكلي (BUY)" if pos["side"] == "BUY" else "بيع هيكلي (SELL)"
         msg = (
-            f"{icon} <b>دخول صفقة ذهب جديدة | XAU/USD</b>\n"
+            f"{icon} <b>دخول صفقة ذهب هيكلية | XAU/USD</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})\n"
             f"📦 <b>حجم العقد:</b> <code>{pos['lots']} Lot</code>\n"
             f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>\n"
-            f"🛡️ <b>الوقف الهيكلي (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})\n"
-            f"🏆 <b>الهدف الهيكلي (TP):</b> <code>${pos['tp']:.2f}</code>\n"
+            f"🛡️ <b>الوقف خلف القمة/القاع (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})\n"
+            f"🏆 <b>الهدف الهيكلي المقابل (TP):</b> <code>${pos['tp']:.2f}</code> ({pos.get('target_rr', 2.0):.2f}R)\n"
+            f"🏛️ <b>محطة الهدف:</b> <code>{pos.get('tp_anchor', 'STRUCTURAL_ZONE')}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 <b>القناعة الكمية:</b> <code>{pos['confidence']}%</code>\n"
-            f"⚙️ <b>السياسة:</b> <code>{pos['policy']}</code>\n"
-            f"📊 <b>حالة السوق:</b> <code>{pos['regime']}</code>\n"
+            f"🧠 <b>القناعة:</b> <code>{pos['confidence']}%</code> | <b>السياسة:</b> <code>{pos['policy']}</code>\n"
+            f"📊 <b>الهيكل:</b> <code>{pos['regime']}</code>\n"
             f"🌍 <b>الجلسة:</b> {session_label}\n"
             f"🕒 <b>التوقيت:</b> <code>{pos['opened_at']} UTC</code>"
         )
@@ -302,12 +302,12 @@ class TelegramNotifier:
 
 
 # ==============================================================================
-# 3. عقل الوكيل الذاتي المستقل (Autonomous Quantitative & SMC Cortex v5)
+# 3. عقل الوكيل الهيكلي المستقل (100% Market-Structure Sniper Cortex v6)
 # ==============================================================================
 class AutonomousQuantitativeBrain:
     POLICIES = (
-        "MOMENTUM_CONTINUATION",
         "GRAVITY_MEAN_REVERSION",
+        "MOMENTUM_CONTINUATION",
         "VOLATILITY_EXPANSION",
     )
 
@@ -340,7 +340,15 @@ class AutonomousQuantitativeBrain:
         self.ema_slow: Optional[float] = None
         self.ema_fast_series: List[Dict] = []
         self.ema_slow_series: List[Dict] = []
-        self.macro_bias: str = "NEUTRAL"  # BULLISH | BEARISH | NEUTRAL
+        self.macro_bias: str = "NEUTRAL"
+
+        # القمم والقيعان الهيكلية المعتمدة في السوق (Swing Highs & Swing Lows)
+        self.swing_highs: List[float] = []
+        self.swing_lows: List[float] = []
+        self.nearest_swing_high: Optional[float] = None
+        self.nearest_swing_low: Optional[float] = None
+        self.range_position_pct: float = 50.0  # 0% = عند القاع الهيكلي، 100% = عند القمة الهيكلية
+
         self.poc_price: Optional[float] = None
         self.vah_price: Optional[float] = None
         self.val_price: Optional[float] = None
@@ -387,7 +395,6 @@ class AutonomousQuantitativeBrain:
             print("Runtime save error:", repr(e))
 
     def _update_drawdown(self, current_val: float):
-        """تحديث الذروة وأقصى سحب (Realized & Floating Drawdown) وحفظها في SQLite."""
         changed = False
         if current_val > self.peak_balance:
             self.peak_balance = round(current_val, 2)
@@ -607,10 +614,9 @@ class AutonomousQuantitativeBrain:
             "text": msg,
         })
 
-    # --------------------------------------------------------------- الإحصاء والرياضيات الكمية
+    # --------------------------------------------------------------- الإحصاء والهيكل السعري
     @staticmethod
     def compute_ema_array(closes: np.ndarray, period: int) -> np.ndarray:
-        """حساب سلسلة EMA القياسية بمتوسط أولي (SMA Seed) مطابق لـ TradingView."""
         n = len(closes)
         if n == 0:
             return np.array([], dtype=float)
@@ -672,6 +678,45 @@ class AutonomousQuantitativeBrain:
         if atr <= 0.15:
             atr = max(1.0, float(closes[-1]) * 0.0004)
         return round(atr, 3)
+
+    def detect_structural_swings(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray):
+        """
+        استخراج القمم والقيعان الهيكلية الحقيقية (Pivot Fractals) من حركة السوق
+        لتحديد أماكن الدخول من الأطراف، ووضع الستوب خلفها، وتحديد الأهداف المقابلة.
+        """
+        n = len(closes)
+        if n < 30:
+            return
+
+        sh_list, sl_list = [], []
+        # فحص الفركتلات (3 شمعات يسار و 2 يمين) على آخر 180 شمعة مغلقة
+        start_idx = max(3, n - 180)
+        for i in range(start_idx, n - 2):
+            if highs[i] >= np.max(highs[i - 3: i + 3]):
+                lvl = round(float(highs[i]), 2)
+                if not sh_list or abs(lvl - sh_list[-1]) > self.atr_value * 0.35:
+                    sh_list.append(lvl)
+            if lows[i] <= np.min(lows[i - 3: i + 3]):
+                lvl = round(float(lows[i]), 2)
+                if not sl_list or abs(lvl - sl_list[-1]) > self.atr_value * 0.35:
+                    sl_list.append(lvl)
+
+        self.swing_highs = sh_list[-10:]
+        self.swing_lows = sl_list[-10:]
+
+        cur_p = float(closes[-1])
+        recent_high = float(np.max(highs[-45:]))
+        recent_low = float(np.min(lows[-45:]))
+
+        # أقرب قمة هيكلية فعالة وأقرب قاع هيكلي فعال
+        above_swings = [h for h in self.swing_highs if h >= cur_p - self.atr_value * 0.8]
+        below_swings = [l for l in self.swing_lows if l <= cur_p + self.atr_value * 0.8]
+
+        self.nearest_swing_high = round(min(above_swings) if above_swings else recent_high, 2)
+        self.nearest_swing_low = round(max(below_swings) if below_swings else recent_low, 2)
+
+        span = max(0.5, recent_high - recent_low)
+        self.range_position_pct = round(float(np.clip((cur_p - recent_low) / span * 100.0, 0.0, 100.0)), 1)
 
     def discover_gravity_and_volume_profile(
         self, opens: np.ndarray, closes: np.ndarray, highs: np.ndarray, lows: np.ndarray
@@ -744,39 +789,94 @@ class AutonomousQuantitativeBrain:
 
         self.discovered_zones = sorted(zones, key=lambda x: x["price"], reverse=True)
 
-    def detect_smc_microstructure(
+    def detect_early_structural_trigger(
         self, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray
     ) -> Dict:
-        result = {"bull_sweep": False, "bear_sweep": False, "bull_fvg": False, "bear_fvg": False, "label": "NONE"}
-        if len(closes) < 25:
-            return result
+        """
+        كاشف الإشارات الهيكلية المبكرة من القمم والقيعان:
+        يرصد سحب السيولة (Liquidity Sweep)، شموع الرفض (Pin-Bar Rejection)، والابتلاع الهيكلي (Engulfing)
+        فور حدوثها عند الأطراف دون انتظار تقاطع المتوسطات المتأخر.
+        """
+        res = {
+            "bull_sweep": False,
+            "bear_sweep": False,
+            "bull_rejection": False,
+            "bear_rejection": False,
+            "bull_fvg": False,
+            "bear_fvg": False,
+            "trigger_low": float(np.min(lows[-5:])),
+            "trigger_high": float(np.max(highs[-5:])),
+            "label": "NONE",
+        }
+        if len(closes) < 22:
+            return res
 
-        o1, h1, l1, c1 = opens[-1], highs[-1], lows[-1], closes[-1]
+        o1, h1, l1, c1 = float(opens[-1]), float(highs[-1]), float(lows[-1]), float(closes[-1])
+        o2, h2, l2, c2 = float(opens[-2]), float(highs[-2]), float(lows[-2]), float(closes[-2])
         rng1 = max(h1 - l1, 1e-4)
-        lower_wick = min(o1, c1) - l1
-        upper_wick = h1 - max(o1, c1)
+        body1 = abs(c1 - o1)
+        lower_wick1 = min(o1, c1) - l1
+        upper_wick1 = h1 - max(o1, c1)
 
-        prev_low = float(np.min(lows[-18:-1]))
-        prev_high = float(np.max(highs[-18:-1]))
+        # القمم والقيعان المحلية لآخر 14 شمعة قبل الشمعة الأخيرة
+        prev_low_14 = float(np.min(lows[-16:-1]))
+        prev_high_14 = float(np.max(highs[-16:-1]))
+        recent_min_3 = float(np.min(lows[-3:]))
+        recent_max_3 = float(np.max(highs[-3:]))
 
-        if l1 < prev_low and c1 > prev_low and (lower_wick / rng1) >= 0.42 and c1 >= o1:
-            result["bull_sweep"] = True
-            result["label"] = "BULL_LIQUIDITY_SWEEP"
-        elif h1 > prev_high and c1 < prev_high and (upper_wick / rng1) >= 0.42 and c1 <= o1:
-            result["bear_sweep"] = True
-            result["label"] = "BEAR_LIQUIDITY_SWEEP"
+        res["trigger_low"] = recent_min_3
+        res["trigger_high"] = recent_max_3
 
-        if lows[-1] > highs[-3] and (closes[-2] - opens[-2]) > self.atr_value * 0.65:
-            result["bull_fvg"] = True
-            if result["label"] == "NONE":
-                result["label"] = "BULLISH_FVG_DISPLACEMENT"
-        elif highs[-1] < lows[-3] and (opens[-2] - closes[-2]) > self.atr_value * 0.65:
-            result["bear_fvg"] = True
-            if result["label"] == "NONE":
-                result["label"] = "BEARISH_FVG_DISPLACEMENT"
+        # 1. Liquidity Sweep (كسر قاع/قمة سابقة ثم الإغلاق داخل النطاق)
+        if (l1 <= prev_low_14 or l2 <= prev_low_14) and c1 > prev_low_14 and (c1 > o1 or lower_wick1 / rng1 >= 0.35):
+            res["bull_sweep"] = True
+            res["label"] = "BULL_LIQUIDITY_SWEEP"
+        elif (h1 >= prev_high_14 or h2 >= prev_high_14) and c1 < prev_high_14 and (c1 < o1 or upper_wick1 / rng1 >= 0.35):
+            res["bear_sweep"] = True
+            res["label"] = "BEAR_LIQUIDITY_SWEEP"
 
-        self.smc_event = result["label"]
-        return result
+        # 2. Structural Rejection / Engulfing عند القيعان أو القمم
+        near_bottom = (
+            self.range_position_pct <= 34.0
+            or (self.nearest_swing_low is not None and abs(recent_min_3 - self.nearest_swing_low) <= self.atr_value * 1.1)
+            or (self.val_price is not None and recent_min_3 <= self.val_price + self.atr_value * 0.6)
+        )
+        near_top = (
+            self.range_position_pct >= 66.0
+            or (self.nearest_swing_high is not None and abs(recent_max_3 - self.nearest_swing_high) <= self.atr_value * 1.1)
+            or (self.vah_price is not None and recent_max_3 >= self.vah_price - self.atr_value * 0.6)
+        )
+
+        bull_pin_or_engulf = (
+            (c1 > o1 and body1 >= self.atr_value * 0.28 and c1 > max(o2, c2))
+            or (lower_wick1 / rng1 >= 0.42 and c1 >= l1 + rng1 * 0.55)
+        )
+        bear_pin_or_engulf = (
+            (c1 < o1 and body1 >= self.atr_value * 0.28 and c1 < min(o2, c2))
+            or (upper_wick1 / rng1 >= 0.42 and c1 <= h1 - rng1 * 0.55)
+        )
+
+        if near_bottom and bull_pin_or_engulf:
+            res["bull_rejection"] = True
+            if res["label"] == "NONE":
+                res["label"] = "BOTTOM_STRUCTURAL_REJECTION"
+        elif near_top and bear_pin_or_engulf:
+            res["bear_rejection"] = True
+            if res["label"] == "NONE":
+                res["label"] = "TOP_STRUCTURAL_REJECTION"
+
+        # 3. Fair Value Gap (FVG) بعد انطلاق السعر من قاع أو قمة
+        if lows[-1] > highs[-3] and (closes[-2] - opens[-2]) > self.atr_value * 0.55:
+            res["bull_fvg"] = True
+            if res["label"] == "NONE":
+                res["label"] = "BULLISH_FVG_IMPULSE"
+        elif highs[-1] < lows[-3] and (opens[-2] - closes[-2]) > self.atr_value * 0.55:
+            res["bear_fvg"] = True
+            if res["label"] == "NONE":
+                res["label"] = "BEARISH_FVG_IMPULSE"
+
+        self.smc_event = res["label"]
+        return res
 
     def synthesize_optimal_policy(
         self, times: np.ndarray, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray
@@ -793,13 +893,13 @@ class AutonomousQuantitativeBrain:
                 "policy": "ROLLOVER_SHIELD",
                 "direction": 0,
                 "score": 20.0,
-                "reason": "درع الحماية مفعل: حظر التداول بين 20:00 و 22:15 UTC لتجنب السبريد والحركات الكاذبة",
+                "reason": "درع الحماية مفعل: حظر التداول أثناء الـ Rollover اليومي (20:30-22:10 UTC)",
             }
 
         sigma = float(np.std(returns)) + 1e-6
         self.volatility_sigma = round(sigma, 3)
 
-        # حساب سلاسل EMA 50 و EMA 150 القياسية على كامل التاريخ للتحليل وللرسم على الشارت
+        # حساب المتوسطات للعرض ولتحديد الميل العام (دون أن تمنع القنص المبكر من القمم والقيعان)
         ema50_arr = self.compute_ema_array(closes, 50)
         ema150_arr = self.compute_ema_array(closes, 150)
         self.ema_fast = float(ema50_arr[-1])
@@ -808,147 +908,97 @@ class AutonomousQuantitativeBrain:
         self.ema_slow_series = [{"time": int(t), "value": float(v)} for t, v in zip(times, ema150_arr)]
 
         cur_close = float(closes[-1])
-
-        if self.ema_fast > self.ema_slow + self.atr_value * 0.25 and cur_close > self.ema_fast:
+        if self.ema_fast > self.ema_slow + self.atr_value * 0.15:
             self.macro_bias = "BULLISH"
-        elif self.ema_fast < self.ema_slow - self.atr_value * 0.25 and cur_close < self.ema_fast:
+        elif self.ema_fast < self.ema_slow - self.atr_value * 0.15:
             self.macro_bias = "BEARISH"
         else:
             self.macro_bias = "NEUTRAL"
 
-        short_drift = float(np.mean(returns[-6:])) / sigma
-        med_drift = float(np.mean(returns[-20:])) / sigma
-        z_score = float((cur_close - np.mean(closes[-35:])) / (np.std(closes[-35:]) + 1e-6))
+        # رصد القمم والقيعان الهيكلية وإشارات الارتداد المبكر
+        self.detect_structural_swings(highs, lows, closes)
+        trig = self.detect_early_structural_trigger(opens, highs, lows, closes)
+
+        micro_drift = float(np.mean(returns[-3:])) / sigma
+        z_score = float((cur_close - np.mean(closes[-30:])) / (np.std(closes[-30:]) + 1e-6))
         self.z_score = round(z_score, 2)
 
-        smc = self.detect_smc_microstructure(opens, highs, lows, closes)
-
-        mom_score = rev_score = brk_score = 0.0
-        for i in range(-25, -1):
-            local_z = (closes[i] - np.mean(closes[i - 15: i])) / (np.std(closes[i - 15: i]) + 1e-6)
-            local_vel = (closes[i] - closes[i - 4]) / sigma
-            next_ret = (closes[i + 1] - closes[i]) / sigma
-            mom_score += np.sign(local_vel) * next_ret
-            if abs(local_z) > 1.1:
-                rev_score += (-np.sign(local_z)) * next_ret
-            if abs(local_vel) > 1.3:
-                brk_score += np.sign(local_vel) * next_ret
-
-        def weighted(policy: str, s: float) -> float:
-            w = self.policy_weights[policy]
-            if session_info["bias"] == "MOMENTUM" and policy in ("MOMENTUM_CONTINUATION", "VOLATILITY_EXPANSION"):
-                w *= 1.08
-            elif session_info["bias"] == "REVERSION" and policy == "GRAVITY_MEAN_REVERSION":
-                w *= 1.08
-            return s * w if s >= 0 else s / w
-
-        scores = {
-            "MOMENTUM_CONTINUATION": weighted("MOMENTUM_CONTINUATION", mom_score),
-            "GRAVITY_MEAN_REVERSION": weighted("GRAVITY_MEAN_REVERSION", rev_score),
-            "VOLATILITY_EXPANSION": weighted("VOLATILITY_EXPANSION", brk_score),
-        }
-
-        if len(self.hist_entropy) >= 60 and self.entropy_rank > 0.88:
+        if len(self.hist_entropy) >= 60 and self.entropy_rank > 0.92:
             self.active_regime = "HIGH_ENTROPY_NOISE"
             return {
                 "policy": "NOISE_FILTER_HOLD",
                 "direction": 0,
-                "score": 32.0,
-                "reason": f"ضجيج عشوائي مرتفع (إنتروبيا {self.entropy} ضمن أعلى 12%)",
+                "score": 35.0,
+                "reason": f"ضجيج عشوائي مرتفع جداً (إنتروبيا {self.entropy}) — انتظار وضوح الهيكل",
             }
 
-        if self.hurst_rank > 0.62:
-            candidates = ("MOMENTUM_CONTINUATION", "VOLATILITY_EXPANSION")
-            regime_name = "PERSISTENT_TREND"
-        elif self.hurst_rank < 0.38:
-            candidates = ("GRAVITY_MEAN_REVERSION",)
-            regime_name = "MEAN_REVERTING_FIELD"
-        else:
-            candidates = tuple(scores.keys())
-            regime_name = "BALANCED_HYBRID"
-
-        policy = max(candidates, key=lambda p: scores[p])
-        raw_edge = scores[policy]
-        trend_mode = policy != "GRAVITY_MEAN_REVERSION"
-        self.active_regime = f"{regime_name} | {self.macro_bias}"
-
         direction = 0
-        conviction = 45.0
+        conviction = 48.0
+        policy = "GRAVITY_MEAN_REVERSION"
         reason = ""
 
-        last_bull_candle = closes[-1] > opens[-1]
-        last_bear_candle = closes[-1] < opens[-1]
+        # ------------------------------------------------------------------
+        # المسار 1: القنص المبكر من القيعان والقمم الهيكلية (Sniper Reversal / Sweep)
+        # ------------------------------------------------------------------
+        if trig["bull_sweep"] or trig["bull_rejection"] or (z_score <= -1.20 and closes[-1] > opens[-1] and self.range_position_pct <= 36.0):
+            direction = 1
+            policy = "GRAVITY_MEAN_REVERSION"
+            base = 79.5 if trig["bull_sweep"] else 76.5
+            conviction = base + min(15.0, abs(z_score) * 4.2 + max(0.0, micro_drift * 3.5))
+            if self.macro_bias == "BULLISH":
+                conviction += 3.0
 
-        if trend_mode:
-            if short_drift > 0.24 and med_drift > 0.10 and self.macro_bias != "BEARISH":
-                if z_score > 1.65:
-                    reason = f"حظر شراء القمة: السعر متمدد بشدة (Z={z_score:.2f} > 1.65) — بانتظار تصحيح"
-                elif last_bull_candle:
-                    direction = 1
-            elif short_drift < -0.24 and med_drift < -0.10 and self.macro_bias != "BULLISH":
-                if z_score < -1.65:
-                    reason = f"حظر بيع القاع: السعر متمدد بشدة (Z={z_score:.2f} < -1.65) — بانتظار تصحيح"
-                elif last_bear_candle:
-                    direction = -1
+        elif trig["bear_sweep"] or trig["bear_rejection"] or (z_score >= 1.20 and closes[-1] < opens[-1] and self.range_position_pct >= 64.0):
+            direction = -1
+            policy = "GRAVITY_MEAN_REVERSION"
+            base = 79.5 if trig["bear_sweep"] else 76.5
+            conviction = base + min(15.0, abs(z_score) * 4.2 + max(0.0, -micro_drift * 3.5))
+            if self.macro_bias == "BEARISH":
+                conviction += 3.0
 
-            if direction != 0:
-                conviction = 75.0 + min(19.0, abs(short_drift) * 13.0 + max(0.0, raw_edge * 2.4))
-                if (direction == 1 and smc["bull_fvg"]) or (direction == -1 and smc["bear_fvg"]):
-                    conviction += 6.0
-                if (direction == 1 and self.macro_bias == "BULLISH") or (direction == -1 and self.macro_bias == "BEARISH"):
-                    conviction += 3.5
-            else:
-                conviction = 54.0 + min(15.0, abs(short_drift) * 9.0)
+        # ------------------------------------------------------------------
+        # المسار 2: استمرار الهيكل بعد ارتداد أولي (Pullback / FVG Displacement)
+        # بشرط عدم الدخول المتأخر في القمة أو القاع!
+        # ------------------------------------------------------------------
+        elif trig["bull_fvg"] and self.range_position_pct < 68.0 and closes[-1] > opens[-1]:
+            direction = 1
+            policy = "VOLATILITY_EXPANSION"
+            conviction = 77.5 + min(14.0, abs(micro_drift) * 4.5)
+        elif trig["bear_fvg"] and self.range_position_pct > 32.0 and closes[-1] < opens[-1]:
+            direction = -1
+            policy = "VOLATILITY_EXPANSION"
+            conviction = 77.5 + min(14.0, abs(micro_drift) * 4.5)
+
         else:
-            near_repulsor_top = any(
-                z["type"] == "REPULSOR_ANOMALY" and abs(cur_close - z["price"]) <= self.atr_value * 1.2
-                for z in self.discovered_zones
-            )
-            if smc["bull_sweep"] or (
-                z_score < -1.55
-                and last_bull_candle
-                and self.macro_bias != "BEARISH"
-                and (near_repulsor_top or cur_close <= (self.val_price or cur_close))
-            ):
-                direction = 1
-            elif smc["bear_sweep"] or (
-                z_score > 1.55
-                and last_bear_candle
-                and self.macro_bias != "BULLISH"
-                and (near_repulsor_top or cur_close >= (self.vah_price or cur_close))
-            ):
-                direction = -1
+            # السعر في المنتصف بدون إشارة قمة أو قاع
+            if 34.0 < self.range_position_pct < 66.0:
+                reason = f"منطقة انتظار وسطى ({self.range_position_pct}% من النطاق) — البوت ينتظر وصول السعر لقمة أو قاع هيكلي"
             else:
-                if abs(z_score) > 1.25:
-                    reason = "حظر ارتداد مبكر: لا يوجد سحب سيولة (Sweep) أو شمعة انعكاسية مؤكدة"
+                reason = "السعر قرب طرف هيكلي — بانتظار أول شمعة ارتداد أو سحب سيولة (Sweep) للدخول المبكر"
+            conviction = 56.0 + min(16.0, abs(z_score) * 6.0)
 
-            if direction != 0:
-                conviction = 76.0 + min(18.0, abs(z_score) * 6.8 + max(0.0, raw_edge * 2.4))
-                if (direction == 1 and smc["bull_sweep"]) or (direction == -1 and smc["bear_sweep"]):
-                    conviction += 7.5
-            else:
-                conviction = 52.0 + min(16.0, abs(z_score) * 7.0)
+        # تطبيق وزن التعلم الذاتي للسياسة المختارة
+        if direction != 0:
+            w = self.policy_weights.get(policy, 1.0)
+            conviction += (w - 1.0) * 6.0
 
-        if direction != 0 and raw_edge <= 0 and self.smc_event == "NONE":
-            direction = 0
-            conviction = min(conviction, 72.0)
-            reason = "السياسة بلا ميزة إحصائية حديثة أو هيكل SMC صريح"
+            # فحص ما إذا كان الدخول يصطدم مباشرة بجدار رفض معاكس قريب جداً
+            if self.discovered_zones:
+                cur_p = self.last_price if self.last_price is not None else cur_close
+                for z in self.discovered_zones:
+                    gap = z["price"] - cur_p
+                    if direction == 1 and 0.15 < gap < self.atr_value * 1.1 and z["type"] == "REPULSOR_ANOMALY":
+                        conviction -= 6.5
+                    elif direction == -1 and -self.atr_value * 1.1 < gap < -0.15 and z["type"] == "REPULSOR_ANOMALY":
+                        conviction -= 6.5
 
-        if self.discovered_zones and direction != 0:
-            cur_p = self.last_price if self.last_price is not None else cur_close
-            nearest = min(self.discovered_zones, key=lambda z: abs(z["price"] - cur_p))
-            gap = nearest["price"] - cur_p
-            if abs(gap) < self.atr_value * 2.2:
-                behind = (gap <= 0) if direction == 1 else (gap >= 0)
-                conviction += 5.5 if behind else -9.0
+        self.active_regime = f"RANGE_POS {self.range_position_pct}% | {self.macro_bias}"
+        final = round(float(np.clip(conviction, 15.0, 98.0)), 1)
 
-        final = round(float(np.clip(conviction, 15.0, 97.5)), 1)
-        if direction == 0 and not reason:
-            reason = "لا إعداد: بانتظار توافق الهيكل الكلي (EMA) مع تدفق السيولة"
-        elif direction != 0 and final < ENTRY_CONFIDENCE:
-            reason = f"إعداد مرصود لكن القناعة {final}% أقل من الحد الآمن ({ENTRY_CONFIDENCE}%)"
+        if direction != 0 and final < ENTRY_CONFIDENCE:
+            reason = f"إعداد أولي عند الطرف لكن القناعة {final}% < {ENTRY_CONFIDENCE}%"
         elif direction != 0:
-            reason = f"إشارة عالية الدقة ({self.smc_event if self.smc_event != 'NONE' else policy})"
+            reason = f"قنص هيكلي مبكر جاهز ({self.smc_event if self.smc_event != 'NONE' else policy})"
 
         return {
             "policy": policy,
@@ -956,8 +1006,10 @@ class AutonomousQuantitativeBrain:
             "score": final,
             "reason": reason,
             "z_score": round(z_score, 2),
-            "short_drift": round(short_drift, 2),
+            "short_drift": round(micro_drift, 2),
             "smc_event": self.smc_event,
+            "trigger_low": trig["trigger_low"],
+            "trigger_high": trig["trigger_high"],
         }
 
     @staticmethod
@@ -991,7 +1043,7 @@ class AutonomousQuantitativeBrain:
         self.hist_entropy.append(self.entropy)
         self.hurst_rank = self._rank(self.hist_hurst, self.hurst)
         self.entropy_rank = self._rank(self.hist_entropy, self.entropy)
-        self.velocity = round(float(np.mean(returns[-5:])), 3)
+        self.velocity = round(float(np.mean(returns[-3:])), 3)
 
         self.discover_gravity_and_volume_profile(opens[-140:], closes[-140:], highs[-140:], lows[-140:])
 
@@ -1001,12 +1053,9 @@ class AutonomousQuantitativeBrain:
 
         d = self._decision
         if d["direction"] != 0 and d["score"] >= ENTRY_CONFIDENCE:
-            req_confirm = 1 if (d.get("smc_event", "NONE") != "NONE" and d["score"] >= 89.0) else SIGNAL_CONFIRM
             self._streak = self._streak + 1 if d["direction"] == self._last_dir else 1
             self._last_dir = d["direction"]
-            d["confirmed"] = self._streak >= req_confirm
-            if not d["confirmed"]:
-                d["reason"] = f"إشارة أولية — بانتظار تأكيد الإغلاق ({self._streak}/{req_confirm} شموع)"
+            d["confirmed"] = self._streak >= SIGNAL_CONFIRM
         else:
             self._streak, self._last_dir = 0, 0
             d["confirmed"] = False
@@ -1043,7 +1092,7 @@ class AutonomousQuantitativeBrain:
             decision = self._decision
 
             if self.open_position is not None:
-                self.block_reason = "صفقة مفتوحة قيد الإدارة"
+                self.block_reason = "صفقة هيكلية مفتوحة قيد الإدارة"
                 await self._manage_open_position(decision)
                 return
 
@@ -1063,7 +1112,7 @@ class AutonomousQuantitativeBrain:
                 self.block_reason = f"درع السبريد مفعل: السبريد الحالي ({self.spread}$) أكبر من الحد الآمن ({MAX_SPREAD}$)"
                 return
             if decision["direction"] != 0 and decision["score"] >= ENTRY_CONFIDENCE and decision.get("confirmed"):
-                self.block_reason = "إشارة مؤكدة — جاري التنفيذ"
+                self.block_reason = "إشارة هيكلية مؤكدة — جاري التنفيذ"
                 await self._open_position(decision)
             else:
                 self.block_reason = decision.get("reason", "لا إعداد")
@@ -1073,38 +1122,124 @@ class AutonomousQuantitativeBrain:
         p = self.last_price - half if side == "BUY" else self.last_price + half
         return round(p, 2)
 
-    def _compute_structural_stops(self, side: str, entry: float) -> tuple[float, float, float]:
-        """حساب الوقف والهدف الهيكلي مع حماية حدود np.clip مهما ارتفع الـ ATR أو السبريد."""
+    def _compute_pure_market_structure_stops(
+        self, side: str, entry: float, decision: Dict
+    ) -> Optional[tuple[float, float, float, str, float]]:
+        """
+        حساب الستوب لوز (SL) والهدف (TP) من هيكل السوق الحقيقي 100%:
+        - الستوب يوضع خلف القمة السابقة أو القاع السابق مباشرة (+ هامش السبريد و 0.35 ATR).
+        - الهدف يوضع عند المحطة الهيكلية المقابلة في السوق (POC / VAH / VAL / KDE Zone / Opposite Swing)
+          بشرط أن تمنح عائداً للمخاطرة >= 1.85R لتعويض أي ستوب سابق.
+        """
         closed = list(self.candles)[:-1]
-        recent = closed[-25:] if len(closed) >= 25 else closed
-        atr = max(0.8, self.atr_value)
-        min_safe_sl = max(MIN_SL_DISTANCE, atr * 2.4 + self.spread * 1.8)
-        upper_sl_bound = max(MAX_SL_DISTANCE, min_safe_sl + 1.25)
+        recent_10 = closed[-10:] if len(closed) >= 10 else closed
+        atr = max(0.7, self.atr_value)
+        buffer = round(self.spread + atr * 0.35, 2)
 
         if side == "BUY":
-            swing_low = min(c["low"] for c in recent) if recent else entry - min_safe_sl
-            raw_sl = min(entry - min_safe_sl, swing_low - atr * 0.55)
-            sl_d = float(np.clip(entry - raw_sl, min_safe_sl, upper_sl_bound))
-            tp_d = round(sl_d * TARGET_RR_RATIO, 2)
-            above_zones = [z["price"] for z in self.discovered_zones if z["price"] > entry + sl_d * 1.6]
-            if above_zones:
-                nearest_res = min(above_zones)
-                if nearest_res - entry < tp_d * 1.10:
-                    tp_d = max(round(sl_d * 1.85, 2), round(nearest_res - entry - 0.20, 2))
-            sl_d = round(sl_d, 2)
-            return round(entry - sl_d, 2), round(entry + tp_d, 2), sl_d
+            # تحديد القاع الفعلي الذي ارتد منه السعر (أدنى ذيل في موجة الارتداد أو القاع الهيكلي القريب)
+            local_low = min(c["low"] for c in recent_10) if recent_10 else entry - atr * 1.5
+            trig_low = float(decision.get("trigger_low", local_low))
+            anchor_low = min(local_low, trig_low)
+            if self.nearest_swing_low is not None and abs(entry - self.nearest_swing_low) <= atr * 2.2:
+                anchor_low = min(anchor_low, self.nearest_swing_low)
+
+            raw_sl = round(anchor_low - buffer, 2)
+            sl_d = round(entry - raw_sl, 2)
+            if sl_d < MIN_SL_DISTANCE:
+                sl_d = MIN_SL_DISTANCE
+                raw_sl = round(entry - sl_d, 2)
+
+            # إذا كانت المسافة للقاع السابق أكبر من الحد الأقصى المسموح، نرفض الدخول المتأخر!
+            if sl_d > MAX_SL_DISTANCE:
+                self.log_thought(
+                    f"تم إلغاء دخول BUY متأخر: القاع الهيكلي يبعد {sl_d:.2f}$ (> {MAX_SL_DISTANCE}$).",
+                    "RISK_SHIELD",
+                )
+                self.cooldown_until = time.time() + 45
+                return None
+
+            # البحث في هيكل السوق العلوي عن أفضل محطة هدف (TP) تحقق >= 1.85R
+            candidates = []
+            if self.poc_price and self.poc_price > entry:
+                candidates.append((self.poc_price - 0.15, "VP_POC"))
+            if self.vah_price and self.vah_price > entry:
+                candidates.append((self.vah_price - 0.20, "VP_VAH"))
+            for z in self.discovered_zones:
+                if z["price"] > entry:
+                    candidates.append((z["price"] - 0.20, f"KDE_{z['type'].split('_')[0]}"))
+            for sh in self.swing_highs:
+                if sh > entry:
+                    candidates.append((sh - 0.20, "SWING_HIGH_TARGET"))
+
+            valid_targets = [
+                (round(tp_p, 2), lbl, round((tp_p - entry) / sl_d, 2))
+                for tp_p, lbl in candidates
+                if (tp_p - entry) >= sl_d * MIN_STRUCTURAL_RR and (tp_p - entry) <= sl_d * 4.2
+            ]
+
+            if valid_targets:
+                # نختار أول محطة هيكلية محققة لشرط العائد المضاعف (>= 1.85R) لضمان دقة الضرب قبل الارتداد
+                valid_targets.sort(key=lambda x: x[0])
+                tp_price, tp_label, rr_val = valid_targets[0]
+            else:
+                tp_d = round(sl_d * FALLBACK_RR_RATIO, 2)
+                tp_price = round(entry + tp_d, 2)
+                tp_label = f"STRUCTURAL_EXTENSION ({FALLBACK_RR_RATIO}R)"
+                rr_val = FALLBACK_RR_RATIO
+
+            return raw_sl, tp_price, sl_d, tp_label, rr_val
+
         else:
-            swing_high = max(c["high"] for c in recent) if recent else entry + min_safe_sl
-            raw_sl = max(entry + min_safe_sl, swing_high + atr * 0.55)
-            sl_d = float(np.clip(raw_sl - entry, min_safe_sl, upper_sl_bound))
-            tp_d = round(sl_d * TARGET_RR_RATIO, 2)
-            below_zones = [z["price"] for z in self.discovered_zones if z["price"] < entry - sl_d * 1.6]
-            if below_zones:
-                nearest_sup = max(below_zones)
-                if entry - nearest_sup < tp_d * 1.10:
-                    tp_d = max(round(sl_d * 1.85, 2), round(entry - nearest_sup - 0.20, 2))
-            sl_d = round(sl_d, 2)
-            return round(entry + sl_d, 2), round(entry - tp_d, 2), sl_d
+            # تحديد القمة الفعلية التي ارتد منها السعر في البيع (SELL)
+            local_high = max(c["high"] for c in recent_10) if recent_10 else entry + atr * 1.5
+            trig_high = float(decision.get("trigger_high", local_high))
+            anchor_high = max(local_high, trig_high)
+            if self.nearest_swing_high is not None and abs(self.nearest_swing_high - entry) <= atr * 2.2:
+                anchor_high = max(anchor_high, self.nearest_swing_high)
+
+            raw_sl = round(anchor_high + buffer, 2)
+            sl_d = round(raw_sl - entry, 2)
+            if sl_d < MIN_SL_DISTANCE:
+                sl_d = MIN_SL_DISTANCE
+                raw_sl = round(entry + sl_d, 2)
+
+            if sl_d > MAX_SL_DISTANCE:
+                self.log_thought(
+                    f"تم إلغاء دخول SELL متأخر: القمة الهيكلية تبعد {sl_d:.2f}$ (> {MAX_SL_DISTANCE}$).",
+                    "RISK_SHIELD",
+                )
+                self.cooldown_until = time.time() + 45
+                return None
+
+            candidates = []
+            if self.poc_price and self.poc_price < entry:
+                candidates.append((self.poc_price + 0.15, "VP_POC"))
+            if self.val_price and self.val_price < entry:
+                candidates.append((self.val_price + 0.20, "VP_VAL"))
+            for z in self.discovered_zones:
+                if z["price"] < entry:
+                    candidates.append((z["price"] + 0.20, f"KDE_{z['type'].split('_')[0]}"))
+            for sl_lvl in self.swing_lows:
+                if sl_lvl < entry:
+                    candidates.append((sl_lvl + 0.20, "SWING_LOW_TARGET"))
+
+            valid_targets = [
+                (round(tp_p, 2), lbl, round((entry - tp_p) / sl_d, 2))
+                for tp_p, lbl in candidates
+                if (entry - tp_p) >= sl_d * MIN_STRUCTURAL_RR and (entry - tp_p) <= sl_d * 4.2
+            ]
+
+            if valid_targets:
+                valid_targets.sort(key=lambda x: x[0], reverse=True)
+                tp_price, tp_label, rr_val = valid_targets[0]
+            else:
+                tp_d = round(sl_d * FALLBACK_RR_RATIO, 2)
+                tp_price = round(entry - tp_d, 2)
+                tp_label = f"STRUCTURAL_EXTENSION ({FALLBACK_RR_RATIO}R)"
+                rr_val = FALLBACK_RR_RATIO
+
+            return raw_sl, tp_price, sl_d, tp_label, rr_val
 
     async def _open_position(self, decision: Dict):
         if self.balance <= 0 or self.last_price is None:
@@ -1113,7 +1248,10 @@ class AutonomousQuantitativeBrain:
         half = self.spread / 2.0
         entry = round(self.last_price + half if side == "BUY" else self.last_price - half, 2)
 
-        sl_price, tp_price, sl_d = self._compute_structural_stops(side, entry)
+        stops = self._compute_pure_market_structure_stops(side, entry, decision)
+        if stops is None:
+            return
+        sl_price, tp_price, sl_d, tp_anchor, target_rr = stops
         conf = decision["score"]
 
         if self.lot_mode == "FIXED_001":
@@ -1122,10 +1260,10 @@ class AutonomousQuantitativeBrain:
             risk_usd = self.balance * MAX_RISK_PCT_CAP
             lots = round(min(MAX_LOT_CAP, max(0.01, risk_usd / max(1.0, sl_d * 100.0))), 2)
 
-        smc_tag = f" | SMC={self.smc_event}" if self.smc_event != "NONE" else ""
+        smc_tag = f" | {self.smc_event}" if self.smc_event != "NONE" else ""
         reason = (
-            f"قناعة {conf}% | {self.active_policy}{smc_tag} | "
-            f"Bias={self.macro_bias} | SL={sl_d}$"
+            f"قناعة {conf}%{smc_tag} | الستوب خلف القمة/القاع ({sl_d}$) | "
+            f"الهدف: {tp_anchor} ({target_rr}R)"
         )
         self.open_position = {
             "id": int(time.time() * 1000) % 1000000,
@@ -1134,6 +1272,8 @@ class AutonomousQuantitativeBrain:
             "current_price": round(self.last_price, 2),
             "sl": sl_price,
             "tp": tp_price,
+            "tp_anchor": tp_anchor,
+            "target_rr": target_rr,
             "initial_risk": sl_d,
             "risk_usd": round(lots * sl_d * 100.0, 2),
             "lots": lots,
@@ -1151,7 +1291,10 @@ class AutonomousQuantitativeBrain:
             "opened_ts": time.time(),
         }
         self._save_runtime_key("open_position", self.open_position)
-        self.log_thought(f"دخول [{side}] عند {entry:.2f}$ بحجم {lots}L (SL={sl_price}$, TP={tp_price}$) — {reason}", "EXECUTION")
+        self.log_thought(
+            f"قنص هيكلي [{side}] عند {entry:.2f}$ ({lots}L) | SL={sl_price}$ | TP={tp_price}$ ({tp_anchor} / {target_rr}R)",
+            "EXECUTION",
+        )
         await self.tg.notify_entry(self.open_position, get_active_session()["label"])
 
     async def _manage_open_position(self, decision: Dict):
@@ -1173,15 +1316,18 @@ class AutonomousQuantitativeBrain:
         pos["r_multiple"] = round(r_multiple, 2)
         held = time.time() - pos["opened_ts"]
 
-        can_partial = pos["lots"] >= 0.02
-        be_trigger_r = 1.35 if can_partial else 1.50
+        # نسبة التقدم نحو الهدف الهيكلي للسوق
+        total_tp_dist = max(0.5, abs(pos["tp"] - pos["entry_price"]))
+        tp_progress = diff / total_tp_dist
 
-        if not pos["be_secured"] and r_multiple >= be_trigger_r:
-            lock = round(max(self.spread * 2.0 + 0.25, pos["initial_risk"] * 0.30), 2)
+        # تأمين الصفقة (Break-Even+) عند قطع 55% من المسافة نحو الهدف الهيكلي أو بلوغ 1.20R
+        can_partial = pos["lots"] >= 0.02
+        if not pos["be_secured"] and (tp_progress >= 0.55 or r_multiple >= 1.20):
+            lock = round(max(self.spread * 1.6 + 0.15, pos["initial_risk"] * 0.25), 2)
             pos["sl"] = round(pos["entry_price"] + lock if side == "BUY" else pos["entry_price"] - lock, 2)
             pos["be_secured"] = True
 
-            note_msg = f"تأمين Break-Even+ عند {r_multiple:.2f}R ونقل الوقف إلى {pos['sl']:.2f}$"
+            note_msg = f"تأمين Break-Even+ عند {r_multiple:.2f}R (قطع {int(tp_progress*100)}% نحو الهدف) ونقل الوقف إلى {pos['sl']:.2f}$"
             if not pos["partial_taken"] and can_partial:
                 closed_lots = round(max(0.01, round(pos["lots"] * 0.5, 2)), 2)
                 if pos["lots"] - closed_lots >= 0.01:
@@ -1190,42 +1336,43 @@ class AutonomousQuantitativeBrain:
                     pos["realized"] = round(pos["realized"] + chunk, 2)
                     pos["lots"] = round(pos["lots"] - closed_lots, 2)
                     pos["partial_taken"] = True
-                    note_msg = f"جني جزئي ({closed_lots}L) عند {r_multiple:.2f}R بربح {chunk:+.2f}$ ونقل الوقف لـ {pos['sl']:.2f}$"
+                    note_msg = f"جني جزئي ({closed_lots}L) بربح {chunk:+.2f}$ ونقل الوقف لـ {pos['sl']:.2f}$"
 
-            self.log_thought(f"تأمين ذكي: {note_msg}", "RISK_SHIELD")
+            self.log_thought(f"تأمين هيكلي: {note_msg}", "RISK_SHIELD")
             self._save_runtime_key("open_position", pos)
             await self.tg.notify_secured(pos, note_msg)
 
-        if pos["be_secured"] and r_multiple >= 1.85:
-            trail_dist = round(max(pos["initial_risk"] * 0.80, self.atr_value * 1.75), 2)
+        # الوقف التتبعي الهيكلي بعد قطع 75% من المسافة نحو الهدف
+        if pos["be_secured"] and (tp_progress >= 0.75 or r_multiple >= 1.65):
+            trail_dist = round(max(pos["initial_risk"] * 0.65, self.atr_value * 1.45), 2)
             if side == "BUY":
                 new_sl = round(q - trail_dist, 2)
-                if new_sl > pos["sl"] + 0.15:
+                if new_sl > pos["sl"] + 0.10:
                     pos["sl"] = new_sl
                     self._save_runtime_key("open_position", pos)
             else:
                 new_sl = round(q + trail_dist, 2)
-                if new_sl < pos["sl"] - 0.15:
+                if new_sl < pos["sl"] - 0.10:
                     pos["sl"] = new_sl
                     self._save_runtime_key("open_position", pos)
 
         hit_tp = q >= pos["tp"] if side == "BUY" else q <= pos["tp"]
         hit_sl = q <= pos["sl"] if side == "BUY" else q >= pos["sl"]
         if hit_tp:
-            await self._close_position(q, "ضرب الهدف الهيكلي الكامل (Structural TP Hit)")
+            await self._close_position(q, f"ضرب الهدف الهيكلي للسوق ({pos.get('tp_anchor', 'Structural TP')})")
             return
         if hit_sl:
-            reason = "وقف الأرباح المتحرك (Secured Trailing SL)" if pos["be_secured"] else "ضرب وقف الحماية الهيكلي (Structural SL)"
+            reason = "وقف الأرباح المتحرك (Secured Trailing SL)" if pos["be_secured"] else "ضرب الوقف الهيكلي خلف القمة/القاع (Structural SL)"
             await self._close_position(q, reason)
             return
 
         opposite = (side == "BUY" and decision["direction"] == -1) or (side == "SELL" and decision["direction"] == 1)
-        if opposite and decision["score"] >= 88.0 and decision.get("confirmed") and held >= OPPOSITE_EXIT_MIN_HOLD_S:
-            await self._close_position(q, f"خروج استباقي مؤكد: انعكاس هيكلي مضاد بقوة {decision['score']}%")
+        if opposite and decision["score"] >= 86.0 and decision.get("confirmed") and held >= OPPOSITE_EXIT_MIN_HOLD_S:
+            await self._close_position(q, f"خروج استباقي: تشكل قمة/قاع انعكاسي مضاد بقوة {decision['score']}%")
             return
 
         if held > STAGNATION_EXIT_S and abs(r_multiple) < 0.20 and self.entropy > 0.86:
-            await self._close_position(q, f"إلغاء الفرضية ذاتياً: تباطؤ الزخم وارتفاع الإنتروبيا لـ {self.entropy}")
+            await self._close_position(q, f"إلغاء الفرضية ذاتياً: ركود السعر وارتفاع الإنتروبيا لـ {self.entropy}")
 
     async def _close_position(self, exit_price: float, reason_exit: str):
         pos = self.open_position
@@ -1544,7 +1691,6 @@ class LiveGoldStream:
                 "PERCEPTION",
             )
 
-        # بث اللقطة الكاملة فوراً لجميع المتصفحات المتصلة لرسم التاريخ الجديد دون الحاجة لتحديث الصفحة
         if self.clients:
             await self._broadcast(self.build_payload("INIT_SNAPSHOT", full=True))
 
@@ -1663,6 +1809,9 @@ class LiveGoldStream:
                 "ema_fast": b.ema_fast,
                 "ema_slow": b.ema_slow,
                 "macro_bias": b.macro_bias,
+                "swing_high": b.nearest_swing_high,
+                "swing_low": b.nearest_swing_low,
+                "range_pos": b.range_position_pct,
                 "poc": b.poc_price,
                 "vah": b.vah_price,
                 "val": b.val_price,
@@ -1670,6 +1819,7 @@ class LiveGoldStream:
                 "regime": b.active_regime,
                 "policy": b.active_policy,
                 "confidence": b.confidence,
+                "entry_threshold": ENTRY_CONFIDENCE,
                 "weights": b.policy_weights,
                 "block_reason": b.block_reason,
             },
@@ -1725,7 +1875,7 @@ async def lifespan(_: FastAPI):
             pass
 
 
-app = FastAPI(title="Autonomous XAU/USD Quantitative Cockpit v5", lifespan=lifespan)
+app = FastAPI(title="Autonomous XAU/USD Structural Sniper Cockpit v6", lifespan=lifespan)
 
 
 @app.websocket("/ws")
@@ -1775,7 +1925,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                 elif cmd == "TEST_TELEGRAM":
                     test_msg = (
-                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Obsidian Cockpit v5</b>\n"
+                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Structural Sniper v6</b>\n"
                         "━━━━━━━━━━━━━━━━━━\n"
                         f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.\n"
                         f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>\n"
@@ -1807,14 +1957,14 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ==============================================================================
-# 5. واجهة Obsidian & Liquid Gold Quantitative Cockpit (Apple VisionOS Design)
+# 5. واجهة Obsidian & Liquid Gold Quantitative Cockpit v6
 # ==============================================================================
 HTML_UI = """<!DOCTYPE html>
 <html lang="ar" dir="rtl" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>XAU/USD — Obsidian & Liquid Gold Quantitative Cockpit v5</title>
+  <title>XAU/USD — Structural Sniper Cockpit v6</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -1890,7 +2040,6 @@ HTML_UI = """<!DOCTYPE html>
       return map[cat] || "bg-slate-700/40 text-slate-300 border-slate-600/40";
     };
 
-    // مكون منحنى الرصيد المصغر (Mini SVG Equity Curve Sparkline)
     function EquitySparkline({ initialBalance, currentEquity, tradeLog }) {
       const points = useMemo(() => {
         const logs = [...(tradeLog || [])].reverse();
@@ -1933,14 +2082,13 @@ HTML_UI = """<!DOCTYPE html>
       );
     }
 
-    // مكون عداد القناعة الدائري المتوهج (Radial Conviction Gauge)
-    function RadialConvictionGauge({ confidence, threshold = 86, macroBias }) {
+    function RadialConvictionGauge({ confidence, threshold = 76, macroBias }) {
       const r = 34;
       const c = 2 * Math.PI * r;
       const pct = Math.min(100, Math.max(0, Number(confidence || 0)));
       const offset = c - (pct / 100) * c;
       const isReady = pct >= threshold;
-      const strokeColor = isReady ? "#10B981" : pct >= 70 ? "#F59E0B" : "#38BDF8";
+      const strokeColor = isReady ? "#10B981" : pct >= 65 ? "#F59E0B" : "#38BDF8";
 
       return (
         <div className="relative flex items-center justify-center w-24 h-24 shrink-0">
@@ -1971,9 +2119,10 @@ HTML_UI = """<!DOCTYPE html>
       );
     }
 
-    // مكون شارت TradingView التفاعلي مع خطوط EMA 50 / EMA 150
+    // مكون الشارت الهيكلي مع خطوط SWING HIGH / SWING LOW و EMA و POC
     function TradingChart({
       candles, latestCandle, zones, openPos, poc, vah, val,
+      swingHigh, swingLow,
       emaFastSeries, emaSlowSeries, emaFastPoint, emaSlowPoint,
       showZones, showVP, showEMA
     }) {
@@ -1984,6 +2133,7 @@ HTML_UI = """<!DOCTYPE html>
       const emaSlowRef = useRef(null);
       const zoneLinesRef = useRef([]);
       const vpLinesRef = useRef([]);
+      const swingLinesRef = useRef([]);
       const posLinesRef = useRef([]);
 
       useEffect(() => {
@@ -2097,6 +2247,35 @@ HTML_UI = """<!DOCTYPE html>
         if (emaSlowPoint) emaSlowRef.current.update(emaSlowPoint);
       }, [emaFastPoint, emaSlowPoint, showEMA]);
 
+      // رسم خطوط القمة الهيكلية والقاع الهيكلي (SWING HIGH / SWING LOW)
+      useEffect(() => {
+        if (!seriesRef.current) return;
+        swingLinesRef.current.forEach(l => seriesRef.current.removePriceLine(l));
+        swingLinesRef.current = [];
+        if (!showZones) return;
+
+        if (swingHigh) {
+          swingLinesRef.current.push(seriesRef.current.createPriceLine({
+            price: swingHigh,
+            color: 'rgba(244, 63, 94, 0.70)',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'قمة هيكلية (SWING H)',
+          }));
+        }
+        if (swingLow) {
+          swingLinesRef.current.push(seriesRef.current.createPriceLine({
+            price: swingLow,
+            color: 'rgba(16, 185, 129, 0.70)',
+            lineWidth: 1,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: 'قاع هيكلي (SWING L)',
+          }));
+        }
+      }, [swingHigh, swingLow, showZones]);
+
       useEffect(() => {
         if (!seriesRef.current) return;
         zoneLinesRef.current.forEach(l => seriesRef.current.removePriceLine(l));
@@ -2175,7 +2354,7 @@ HTML_UI = """<!DOCTYPE html>
           lineWidth: 2,
           lineStyle: LightweightCharts.LineStyle.Dotted,
           axisLabelVisible: true,
-          title: 'TP (2.3R)',
+          title: `TP (${openPos.target_rr || 2.0}R)`,
         }));
         posLinesRef.current.push(seriesRef.current.createPriceLine({
           price: openPos.sl,
@@ -2183,7 +2362,7 @@ HTML_UI = """<!DOCTYPE html>
           lineWidth: 2,
           lineStyle: LightweightCharts.LineStyle.Dotted,
           axisLabelVisible: true,
-          title: openPos.be_secured ? 'SL (BE+)' : 'SAFE SL',
+          title: openPos.be_secured ? 'SL (BE+)' : 'SWING SL',
         }));
       }, [openPos]);
 
@@ -2220,8 +2399,10 @@ HTML_UI = """<!DOCTYPE html>
           hurst: 0.5, hurst_rank: 50, entropy: 0.5, entropy_rank: 50,
           velocity: 0, sigma: 0, atr: 1.5, z_score: 0,
           ema_fast: null, ema_slow: null, macro_bias: "NEUTRAL",
+          swing_high: null, swing_low: null, range_pos: 50,
           poc: null, vah: null, val: null, smc_event: "NONE",
           regime: "INITIALIZING", policy: "OBSERVING", confidence: 0,
+          entry_threshold: 76.0,
           weights: {}, block_reason: "تجميع البيانات..."
         },
         discovered_zones: [],
@@ -2311,7 +2492,6 @@ HTML_UI = """<!DOCTYPE html>
       const { cognition: cog, kpis, open_position: pos, session, telegram: tg } = state;
       const spreadLimit = state.max_spread || 0.99;
 
-      // إضاءة محيطية ديناميكية حسب حالة السوق (Ambient Aura)
       const ambientAura = useMemo(() => {
         if (cog.macro_bias === "BULLISH") {
           return "radial-gradient(at 15% 0%, rgba(16, 185, 129, 0.10) 0px, transparent 50%), radial-gradient(at 85% 5%, rgba(245, 158, 11, 0.06) 0px, transparent 45%)";
@@ -2340,7 +2520,7 @@ HTML_UI = """<!DOCTYPE html>
         if (!pos) {
           return (
             <div className="py-5 text-center text-xs text-slate-400">
-              لا توجد صفقة نشطة حالياً — يفحص الوكيل توافق الهيكل الكلي (EMA 50/150) مع سحب السيولة (SMC).
+              لا توجد صفقة نشطة حالياً — الوكيل يراقب القمم والقيعان الهيكلية (Swing High / Swing Low) لقنص بداية الارتداد.
             </div>
           );
         }
@@ -2362,15 +2542,15 @@ HTML_UI = """<!DOCTYPE html>
                 <span className="font-bold mono text-sm text-white">${pos.current_price.toFixed(2)}</span>
               </div>
               <div className="vision-pill p-2.5">
-                <span className="text-[10px] text-slate-400 block">الوقف الآمن (SL)</span>
+                <span className="text-[10px] text-slate-400 block">الوقف الهيكلي (SL)</span>
                 <span className="font-bold mono text-sm text-rose-400">${pos.sl.toFixed(2)}</span>
               </div>
               <div className="vision-pill p-2.5">
-                <span className="text-[10px] text-slate-400 block">الهدف (TP 2.3R)</span>
+                <span className="text-[10px] text-slate-400 block">الهدف ({pos.target_rr || 2.0}R)</span>
                 <span className="font-bold mono text-sm text-emerald-400">${pos.tp.toFixed(2)}</span>
               </div>
               <div className="vision-pill p-2.5">
-                <span className="text-[10px] text-slate-400 block">العائد (R)</span>
+                <span className="text-[10px] text-slate-400 block">العائد اللحظي (R)</span>
                 <span className={`font-bold mono text-sm ${(pos.r_multiple || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
                   {(pos.r_multiple || 0) >= 0 ? '+' : ''}{Number(pos.r_multiple || 0).toFixed(2)}R
                 </span>
@@ -2387,7 +2567,7 @@ HTML_UI = """<!DOCTYPE html>
               <div className="flex items-center justify-between text-[11px] mb-1.5">
                 <span className="text-rose-400 mono font-semibold">SL: ${pos.sl.toFixed(2)}</span>
                 <span className="text-slate-300 text-[11px]">
-                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+ مفعل)' : '⏳ تحت المراقبة الحية (تأمين عند 1.35R)'}
+                  {pos.be_secured ? '🛡️ مؤمّنة (Break-Even+ مفعل)' : `🎯 محطة الهدف: ${pos.tp_anchor || 'STRUCTURAL_TP'}`}
                 </span>
                 <span className="text-emerald-400 mono font-semibold">TP: ${pos.tp.toFixed(2)}</span>
               </div>
@@ -2546,26 +2726,40 @@ HTML_UI = """<!DOCTYPE html>
         </div>
       );
 
-      // لوحة الوعي الرياضي بتصميم Obsidian & Liquid Gold مع العداد الدائري
       const renderCortexPanel = () => (
         <div className="vision-card p-4 flex flex-col gap-3.5">
           <div className="flex items-center justify-between gap-3">
             <div className="flex-1">
               <div className="flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-amber-400"></span>
-                <h2 className="text-xs font-extrabold gold-gradient-text tracking-wide">القشرة الكمية والهيكلية (Cortex v5)</h2>
+                <h2 className="text-xs font-extrabold gold-gradient-text tracking-wide">قناص القمم والقيعان الهيكلي (v6)</h2>
               </div>
               <p className="text-[11px] text-slate-300 mt-1.5 leading-relaxed">{cog.block_reason}</p>
               <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] mono">
-                <span className="px-2 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
-                  EMA50: {cog.ema_fast ? `$${cog.ema_fast}` : '--'}
+                <span className="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30">
+                  Swing H: {cog.swing_high ? `$${cog.swing_high.toFixed(2)}` : '--'}
                 </span>
-                <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                  EMA150: {cog.ema_slow ? `$${cog.ema_slow}` : '--'}
+                <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                  Swing L: {cog.swing_low ? `$${cog.swing_low.toFixed(2)}` : '--'}
                 </span>
               </div>
             </div>
-            <RadialConvictionGauge confidence={cog.confidence} threshold={86} macroBias={cog.macro_bias} />
+            <RadialConvictionGauge confidence={cog.confidence} threshold={cog.entry_threshold || 76} macroBias={cog.macro_bias} />
+          </div>
+
+          {/* مؤشر موقع السعر بين القاع الهيكلي والقمة الهيكلية */}
+          <div className="vision-pill p-2.5">
+            <div className="flex items-center justify-between text-[10px] mb-1">
+              <span className="text-emerald-400 font-bold">قاع الشراء (0-34%)</span>
+              <span className="mono text-slate-300">موقع السعر: {cog.range_pos}%</span>
+              <span className="text-rose-400 font-bold">قمة البيع (66-100%)</span>
+            </div>
+            <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden relative">
+              <div
+                className="h-full bg-gradient-to-l from-rose-500 via-slate-500 to-emerald-400 transition-all duration-300"
+                style={{ width: `${Math.min(100, Math.max(0, cog.range_pos || 50))}%` }}
+              />
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-xs">
@@ -2575,9 +2769,6 @@ HTML_UI = """<!DOCTYPE html>
                 <span className="mono text-emerald-400">{cog.hurst_rank}%</span>
               </div>
               <div className="font-bold text-emerald-300 mt-0.5 mono text-sm">{Number(cog.hurst).toFixed(3)}</div>
-              <div className="w-full h-1 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
-                <div className="h-full bg-emerald-400" style={{ width: `${Math.min(100, cog.hurst_rank)}%` }} />
-              </div>
             </div>
 
             <div className="vision-pill p-2.5">
@@ -2586,9 +2777,6 @@ HTML_UI = """<!DOCTYPE html>
                 <span className="mono text-amber-400">{cog.entropy_rank}%</span>
               </div>
               <div className="font-bold text-amber-300 mt-0.5 mono text-sm">{Number(cog.entropy).toFixed(3)}</div>
-              <div className="w-full h-1 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
-                <div className="h-full bg-amber-400" style={{ width: `${Math.min(100, cog.entropy_rank)}%` }} />
-              </div>
             </div>
 
             <div className="vision-pill p-2.5">
@@ -2630,7 +2818,7 @@ HTML_UI = """<!DOCTYPE html>
           </div>
 
           <div className="pt-2 border-t border-white/[0.06]">
-            <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">أوزان التعلم المعزز (Reinforcement Weights):</div>
+            <div className="text-[11px] text-slate-400 mb-1.5 font-semibold">أوزان التعلم المعزز:</div>
             <div className="grid grid-cols-3 gap-1.5 text-[11px] mono">
               {Object.entries(cog.weights || {}).map(([k, v]) => (
                 <div key={k} className="vision-pill px-2 py-1 text-center">
@@ -2673,7 +2861,6 @@ HTML_UI = """<!DOCTYPE html>
         <div style={{ backgroundImage: ambientAura }} className="min-h-screen transition-all duration-700">
           <div className="min-h-screen flex flex-col p-2.5 sm:p-3.5 lg:p-4 pb-24 lg:pb-4 gap-3.5 max-w-[1920px] mx-auto select-none">
 
-            {/* 1. قمرة القيادة العلوية (Obsidian & Liquid Gold Header) */}
             <header className="vision-card p-3 sm:p-3.5 flex flex-col gap-2.5">
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <div className="flex items-center gap-3">
@@ -2684,7 +2871,7 @@ HTML_UI = """<!DOCTYPE html>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-black text-base sm:text-lg tracking-tight gold-gradient-text mono">XAU/USD</span>
                       <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                        OBSIDIAN v5
+                        SNIPER v6
                       </span>
                       <span className="hidden sm:inline-block text-[10px] px-2.5 py-0.5 rounded-full bg-white/5 text-slate-300 border border-white/10">
                         {session?.label}
@@ -2694,7 +2881,6 @@ HTML_UI = """<!DOCTYPE html>
                   </div>
                 </div>
 
-                {/* السعر اللحظي والسبريد وأزرار التحكم */}
                 <div className="flex items-center gap-3">
                   <div className="text-left sm:text-right">
                     <div className={`text-xl sm:text-2xl font-black transition-colors duration-200 mono ${priceFlash}`}>
@@ -2742,7 +2928,6 @@ HTML_UI = """<!DOCTYPE html>
                 </div>
               </div>
 
-              {/* شريط المؤشرات المالية مع منحنى الرصيد المصغر (Sparkline) */}
               <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1.5 border-t border-white/[0.06]">
                 <div className="vision-pill px-3 py-1.5 shrink-0 flex items-center gap-3 min-w-[175px]">
                   <div>
@@ -2795,13 +2980,12 @@ HTML_UI = """<!DOCTYPE html>
               </div>
             </header>
 
-            {/* 2. مساحة عمل سطح المكتب (Desktop 12-Col Bento Grid) */}
             <div className="hidden lg:grid lg:grid-cols-12 gap-3.5 flex-1">
               <div className="lg:col-span-8 flex flex-col gap-3.5">
                 <div className="vision-card p-3.5 flex-1 flex flex-col relative">
                   <div className="flex items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.06]">
                     <div className="flex items-center gap-2.5">
-                      <span className="text-xs font-bold text-slate-200">الشارت الهيكلي والكمي (XAU/USD {state.tf_min}m)</span>
+                      <span className="text-xs font-bold text-slate-200">الشارت الهيكلي (XAU/USD {state.tf_min}m)</span>
                       <span className="vision-pill px-2.5 py-0.5 text-[11px] mono text-amber-300 font-semibold">
                         ⏱ {formatCountdown(state.candle_rem_s || 0)}
                       </span>
@@ -2819,7 +3003,7 @@ HTML_UI = """<!DOCTYPE html>
                           showEMA ? 'bg-sky-500/15 text-sky-300 border-sky-500/30' : 'bg-white/5 text-slate-400 border-white/5'
                         }`}
                       >
-                        EMA 50/150
+                        EMA
                       </button>
                       <button
                         onClick={() => setShowZones(!showZones)}
@@ -2827,7 +3011,7 @@ HTML_UI = """<!DOCTYPE html>
                           showZones ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/5'
                         }`}
                       >
-                        KDE Zones
+                        Swings & KDE
                       </button>
                       <button
                         onClick={() => setShowVP(!showVP)}
@@ -2848,6 +3032,8 @@ HTML_UI = """<!DOCTYPE html>
                     poc={cog.poc}
                     vah={cog.vah}
                     val={cog.val}
+                    swingHigh={cog.swing_high}
+                    swingLow={cog.swing_low}
                     emaFastSeries={emaFastSeries}
                     emaSlowSeries={emaSlowSeries}
                     emaFastPoint={emaFastPoint}
@@ -2900,7 +3086,6 @@ HTML_UI = """<!DOCTYPE html>
               </div>
             </div>
 
-            {/* 3. عرض الهاتف الذكي (Mobile Views) */}
             <div className="flex lg:hidden flex-col gap-3 flex-1">
               {mobileNav === "CHART" && (
                 <>
@@ -2927,7 +3112,7 @@ HTML_UI = """<!DOCTYPE html>
                             showZones ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-white/5 text-slate-400 border-white/5'
                           }`}
                         >
-                          KDE
+                          Swings
                         </button>
                         <button
                           onClick={() => setShowVP(!showVP)}
@@ -2948,6 +3133,8 @@ HTML_UI = """<!DOCTYPE html>
                       poc={cog.poc}
                       vah={cog.vah}
                       val={cog.val}
+                      swingHigh={cog.swing_high}
+                      swingLow={cog.swing_low}
                       emaFastSeries={emaFastSeries}
                       emaSlowSeries={emaSlowSeries}
                       emaFastPoint={emaFastPoint}
@@ -2961,7 +3148,7 @@ HTML_UI = """<!DOCTYPE html>
                   <div className="vision-card p-3.5">
                     <div className="flex items-center justify-between mb-2 pb-2 border-b border-white/[0.06]">
                       <span className="text-xs font-bold gold-gradient-text">الصفقة النشطة وحالة القرار</span>
-                      <span className="text-[11px] font-bold mono text-amber-300">{cog.confidence}% | {cog.macro_bias}</span>
+                      <span className="text-[11px] font-bold mono text-amber-300">{cog.confidence}% | Pos: {cog.range_pos}%</span>
                     </div>
                     <p className="text-[11px] text-slate-300 mb-2.5">{cog.block_reason}</p>
                     {renderActivePosition()}
@@ -2993,7 +3180,6 @@ HTML_UI = """<!DOCTYPE html>
               )}
             </div>
 
-            {/* 4. كبسولة التنقل السفلية العائمة للهاتف (iOS 18 Floating Pill Dock) */}
             <nav className="lg:hidden fixed bottom-3 left-3 right-3 z-50 vision-card px-2 py-1.5 flex items-center justify-around">
               <button
                 onClick={() => setMobileNav("CHART")}
@@ -3012,7 +3198,7 @@ HTML_UI = """<!DOCTYPE html>
                 }`}
               >
                 <span>🧠</span>
-                <span>الوعي الكمي</span>
+                <span>الوعي الهيكلي</span>
               </button>
               <button
                 onClick={() => setMobileNav("LOGS")}
