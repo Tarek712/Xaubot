@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -157,6 +158,398 @@ def init_db():
 
 
 init_db()
+
+
+# ==============================================================================
+# 1.5 وحدة الاستراتيجية الذكية (ML): المؤشرات + النموذج + التدريب في ملف واحد
+#     - التدريب:  python app.py train --csv data/xauusd_m15.csv --tf M15 --utc-offset 3
+#     - فحص:      python app.py check --csv data/xauusd_m15.csv
+#     - إن لم يوجد gold_model.joblib يعمل البوت باستراتيجيته الأصلية دون توقف.
+# ==============================================================================
+import sys
+
+try:
+    import pandas as pd
+    import joblib
+    ML_DEPS_OK = True
+except ImportError:
+    pd = joblib = None
+    ML_DEPS_OK = False
+
+try:
+    from lightgbm import LGBMClassifier
+    HAVE_LGBM = True
+except Exception:
+    HAVE_LGBM = False
+try:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import roc_auc_score
+except Exception:
+    HistGradientBoostingClassifier = roc_auc_score = None
+
+ML_MODEL_PATH = os.getenv("GOLD_MODEL_PATH", "gold_model.joblib")
+
+MIN_ROWS = 130          # أقل عدد شموع مغلقة لحساب كل الميزات (EMA100 + متوسط ATR لـ 100)
+TF_MAP = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+
+
+
+
+def _ml_to_frame(candles):
+    """يقبل قائمة dict بنفس شكل شموع البوت: time(epoch ثوانٍ) / open / high / low / close."""
+    df = pd.DataFrame(candles)
+    if df.empty:
+        return df
+    if np.issubdtype(df["time"].dtype, np.number):
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+    else:
+        df["time"] = pd.to_datetime(df["time"])
+    return df[["time", "open", "high", "low", "close"]].astype(
+        {"open": float, "high": float, "low": float, "close": float}
+    ).reset_index(drop=True)
+
+
+
+# ----------------------------------------------------------------- البيانات
+def ml_load_csv(path):
+    """يقرأ ملف MT5 (مفصول بتبويب أو فاصلة) أو أي CSV بأعمدة time/open/high/low/close."""
+    df = pd.read_csv(path, sep=None, engine="python")
+    df.columns = [c.strip().lower().strip("<>") for c in df.columns]
+    if "date" in df.columns and "time" in df.columns:
+        df["time"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str))
+    elif "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"])
+    elif "datetime" in df.columns:
+        df["time"] = pd.to_datetime(df["datetime"])
+    else:
+        sys.exit("لم أجد عمود الوقت (time أو date+time) في الملف")
+    for c in ("open", "high", "low", "close"):
+        if c not in df.columns:
+            sys.exit(f"العمود المفقود: {c}")
+    vol = "tickvol" if "tickvol" in df.columns else ("volume" if "volume" in df.columns else None)
+    df["volume"] = df[vol] if vol else 0.0
+    df = df[["time", "open", "high", "low", "close", "volume"]]
+    return df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+
+
+def ml_load_mt5(symbol, tf, bars):
+    import MetaTrader5 as mt5
+    if not mt5.initialize():
+        sys.exit(f"فشل الاتصال بـ MT5: {mt5.last_error()}")
+    tfs = {"M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
+           "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1}
+    rates = mt5.copy_rates_from_pos(symbol, tfs[tf], 0, bars)
+    mt5.shutdown()
+    if rates is None or len(rates) == 0:
+        sys.exit("لم يتم جلب بيانات. تأكد من اسم الرمز (قد يكون GOLD أو XAUUSD.a عند وسيطك)")
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df["volume"] = df["tick_volume"]
+    return df[["time", "open", "high", "low", "close", "volume"]]
+
+
+# ----------------------------------------------------------------- الميزات
+def ml_make_features(df):
+    d = df.copy()
+    c, h, l = d["close"], d["high"], d["low"]
+    prev_c = c.shift(1)
+
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    d["atr"] = tr.rolling(14).mean()
+
+    f = pd.DataFrame(index=d.index)
+    for n in (1, 2, 3, 5, 10, 20, 50):
+        f[f"ret_{n}"] = c.pct_change(n)
+    for n in (10, 20, 50, 100):
+        ema = c.ewm(span=n, adjust=False).mean()
+        f[f"dist_ema_{n}"] = (c - ema) / d["atr"]
+    f["ema_slope_20"] = c.ewm(span=20, adjust=False).mean().diff(5) / d["atr"]
+
+    delta = c.diff()
+    up = delta.clip(lower=0).rolling(14).mean()
+    dn = (-delta.clip(upper=0)).rolling(14).mean()
+    f["rsi_14"] = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+    ma20, sd20 = c.rolling(20).mean(), c.rolling(20).std()
+    f["bb_pos"] = (c - ma20) / (2 * sd20.replace(0, np.nan))
+    f["atr_pct"] = d["atr"] / c
+    f["atr_ratio"] = d["atr"] / d["atr"].rolling(100).mean()
+    f["vol_20"] = c.pct_change().rolling(20).std()
+    f["range_atr"] = (h - l) / d["atr"]
+    f["body_atr"] = (c - d["open"]) / d["atr"]
+    f["upper_wick"] = (h - np.maximum(c, d["open"])) / d["atr"]
+    f["lower_wick"] = (np.minimum(c, d["open"]) - l) / d["atr"]
+    f["hh_20"] = (c - h.rolling(20).max()) / d["atr"]
+    f["ll_20"] = (c - l.rolling(20).min()) / d["atr"]
+
+    hr = d["time"].dt.hour
+    f["hour_sin"], f["hour_cos"] = np.sin(2 * np.pi * hr / 24), np.cos(2 * np.pi * hr / 24)
+    dow = d["time"].dt.dayofweek
+    f["dow_sin"], f["dow_cos"] = np.sin(2 * np.pi * dow / 5), np.cos(2 * np.pi * dow / 5)
+
+    return f.replace([np.inf, -np.inf], np.nan), d["atr"]
+
+
+# ----------------------------------------------------------------- الأهداف (Triple Barrier)
+def ml_barrier_outcomes(df, atr, tp_mult, sl_mult, horizon, spread):
+    """
+    لكل شمعة نحسب نتيجة صفقة شراء وصفقة بيع (بوحدة السعر) لو دخلنا عند الإغلاق:
+    الهدف = tp_mult*ATR ، الوقف = sl_mult*ATR ، المهلة = horizon شمعة.
+    إن لمست الشمعة الهدف والوقف معاً نفترض الوقف أولاً (تحفظ).
+    ثم نطرح السبريد.
+    """
+    n = len(df)
+    close, high, low = df["close"].values, df["high"].values, df["low"].values
+    a = atr.values
+    tp_d, sl_d = tp_mult * a, sl_mult * a
+
+    res = {}
+    for side in ("long", "short"):
+        pnl = np.full(n, np.nan)
+        done = np.zeros(n, dtype=bool)
+        for k in range(1, horizon + 1):
+            hi = np.full(n, np.nan); lo = np.full(n, np.nan)
+            hi[:n - k], lo[:n - k] = high[k:], low[k:]
+            if side == "long":
+                hit_sl = lo <= close - sl_d
+                hit_tp = hi >= close + tp_d
+            else:
+                hit_sl = hi >= close + sl_d
+                hit_tp = lo <= close - tp_d
+            valid = ~np.isnan(hi) & ~done & ~np.isnan(a)
+            m_sl = valid & hit_sl
+            pnl[m_sl] = -sl_d[m_sl]
+            done |= m_sl
+            m_tp = valid & hit_tp & ~done
+            pnl[m_tp] = tp_d[m_tp]
+            done |= m_tp
+        # من لم يلمس شيئاً: يُغلق بعد المهلة بسعر الإغلاق
+        idx = np.arange(n)
+        end = np.minimum(idx + horizon, n - 1)
+        timeout = ~done & ~np.isnan(a) & (idx + horizon < n)
+        diff = close[end] - close
+        pnl[timeout] = (diff if side == "long" else -diff)[timeout]
+        res[side] = pnl - spread
+    return res["long"], res["short"]
+
+
+# ----------------------------------------------------------------- النموذج
+def ml_new_model(seed=42):
+    if HAVE_LGBM:
+        return LGBMClassifier(n_estimators=300, learning_rate=0.03, num_leaves=15,
+                              min_child_samples=100, subsample=0.8, subsample_freq=1,
+                              colsample_bytree=0.8, reg_lambda=5.0, random_state=seed, verbose=-1)
+    return HistGradientBoostingClassifier(max_iter=250, learning_rate=0.04, max_leaf_nodes=15,
+                                          min_samples_leaf=100, l2_regularization=5.0,
+                                          random_state=seed)
+
+
+def ml_summarize(pnl, label):
+    pnl = np.asarray(pnl)
+    if len(pnl) == 0:
+        print(f"{label:>10}: لا صفقات")
+        return {}
+    wins, losses = pnl[pnl > 0].sum(), -pnl[pnl < 0].sum()
+    pf = wins / losses if losses > 0 else np.inf
+    eq = np.cumsum(pnl)
+    dd = (np.maximum.accumulate(eq) - eq).max()
+    print(f"{label:>10}: صفقات={len(pnl):5d}  نسبة الربح={np.mean(pnl > 0):5.1%}  "
+          f"معامل الربح={pf:5.2f}  متوسط/صفقة={pnl.mean():+.3f}$  مجموع={pnl.sum():+9.1f}$  أقصى تراجع={dd:8.1f}$")
+    return {"n": len(pnl), "pf": pf, "mean": pnl.mean(), "total": pnl.sum(), "dd": dd}
+
+
+# ----------------------------------------------------------------- Walk-Forward
+def ml_walk_forward(X, y_long, y_short, pnl_long, pnl_short, horizon, n_splits, min_train, thresholds):
+    n = len(X)
+    test_size = (n - min_train) // n_splits
+    if test_size < 200:
+        sys.exit("البيانات قليلة جداً للـ Walk-Forward. زِد البيانات أو قلل --splits")
+
+    oos = {"p_long": np.full(n, np.nan), "p_short": np.full(n, np.nan)}
+    aucs = []
+    for i in range(n_splits):
+        te_start = min_train + i * test_size
+        te_end = n if i == n_splits - 1 else te_start + test_size
+        tr_end = te_start - horizon          # فجوة (Purge) لمنع تسرب المستقبل
+        tr = slice(0, tr_end)
+        ml, ms = ml_new_model(), ml_new_model()
+        ml.fit(X.iloc[tr], y_long[tr]); ms.fit(X.iloc[tr], y_short[tr])
+        oos["p_long"][te_start:te_end] = ml.predict_proba(X.iloc[te_start:te_end])[:, 1]
+        oos["p_short"][te_start:te_end] = ms.predict_proba(X.iloc[te_start:te_end])[:, 1]
+        try:
+            auc = (roc_auc_score(y_long[te_start:te_end], oos["p_long"][te_start:te_end]) +
+                   roc_auc_score(y_short[te_start:te_end], oos["p_short"][te_start:te_end])) / 2
+            aucs.append(auc)
+            print(f"  نافذة {i + 1}/{n_splits}: تدريب={tr_end}  اختبار={te_end - te_start}  AUC={auc:.3f}")
+        except ValueError:
+            print(f"  نافذة {i + 1}/{n_splits}: تعذر حساب AUC")
+
+    print(f"\nمتوسط AUC خارج العينة: {np.mean(aucs):.3f}   (0.50 = لا ميزة، فوق 0.53 بثبات = إشارة مقبولة)")
+    print("\nنتائج خارج العينة بعد خصم السبريد، حسب عتبة الاحتمال:")
+    best = None
+    pl, ps = oos["p_long"], oos["p_short"]
+    valid = ~np.isnan(pl)
+    for thr in thresholds:
+        go_long = valid & (pl > thr) & (pl >= ps)
+        go_short = valid & (ps > thr) & (ps > pl)
+        trades = np.concatenate([pnl_long[go_long], pnl_short[go_short]])
+        trades = trades[~np.isnan(trades)]
+        s = ml_summarize(trades, f"thr={thr:.2f}")
+        if s and s["n"] >= 200 and s["mean"] > 0 and (best is None or s["mean"] > best[1]):
+            best = (thr, s["mean"])
+    return best
+
+
+# ----------------------------------------------------------------- التشغيل
+def ml_train_main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv"); ap.add_argument("--mt5", action="store_true")
+    ap.add_argument("--symbol", default="XAUUSD"); ap.add_argument("--tf", default="H1")
+    ap.add_argument("--bars", type=int, default=60000)
+    ap.add_argument("--tp", type=float, default=1.5, help="الهدف بوحدات ATR")
+    ap.add_argument("--sl", type=float, default=1.0, help="الوقف بوحدات ATR")
+    ap.add_argument("--horizon", type=int, default=24, help="أقصى مدة للصفقة (بالشموع)")
+    ap.add_argument("--spread", type=float, default=0.30, help="تكلفة الصفقة بالدولار لكل أونصة (سبريد+عمولة)")
+    ap.add_argument("--splits", type=int, default=5)
+    ap.add_argument("--min-train", type=float, default=0.4, help="نسبة بيانات التدريب الأولى")
+    ap.add_argument("--utc-offset", type=float, default=0.0,
+                    help="فرق توقيت وسيطك عن UTC بالساعات (مثلاً 2 أو 3). البوت يعمل بتوقيت UTC فيجب توحيد التوقيت")
+    ap.add_argument("--out", default="gold_model.joblib")
+    a = ap.parse_args(argv)
+
+    if a.mt5:
+        df = ml_load_mt5(a.symbol, a.tf, a.bars)
+    elif a.csv:
+        df = ml_load_csv(a.csv)
+    else:
+        sys.exit("حدد --csv ملف.csv أو --mt5")
+    if a.utc_offset:
+        df["time"] = df["time"] - pd.Timedelta(hours=a.utc_offset)
+    print(f"البيانات: {len(df)} شمعة  من {df['time'].iloc[0]} إلى {df['time'].iloc[-1]}")
+    print(f"النموذج: {'LightGBM' if HAVE_LGBM else 'sklearn HistGradientBoosting'}\n")
+
+    X, atr = ml_make_features(df)
+    pnl_long, pnl_short = ml_barrier_outcomes(df, atr, a.tp, a.sl, a.horizon, a.spread)
+    y_long = (pnl_long > 0).astype(int)
+    y_short = (pnl_short > 0).astype(int)
+
+    ok = X.notna().all(axis=1).values & ~np.isnan(pnl_long) & ~np.isnan(pnl_short)
+    X, y_long, y_short = X[ok].reset_index(drop=True), y_long[ok], y_short[ok]
+    pnl_long, pnl_short = pnl_long[ok], pnl_short[ok]
+    print(f"عينات صالحة: {len(X)}   نسبة نجاح الشراء الأساسية: {y_long.mean():.1%}   البيع: {y_short.mean():.1%}")
+    print("(بدون أي نموذج: الصفقة العشوائية خاسرة عادةً بسبب السبريد، وهذا هو الخط الأساسي)\n")
+    print("Walk-Forward:")
+
+    thresholds = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.65]
+    min_train = int(len(X) * a.min_train)
+    best = ml_walk_forward(X, y_long, y_short, pnl_long, pnl_short, a.horizon, a.splits, min_train, thresholds)
+
+    # النموذج النهائي على كل البيانات (للاستخدام الحي بعد قبول النتائج أعلاه)
+    ml, ms = ml_new_model(), ml_new_model()
+    ml.fit(X.iloc[:-a.horizon], y_long[:-a.horizon]); ms.fit(X.iloc[:-a.horizon], y_short[:-a.horizon])
+    thr = best[0] if best else 0.60
+    joblib.dump({"model_long": ml, "model_short": ms, "features": list(X.columns), "threshold": thr,
+                 "tp_mult": a.tp, "sl_mult": a.sl, "horizon": a.horizon, "timeframe": a.tf,
+                 "symbol": a.symbol}, a.out)
+    print(f"\nتم الحفظ: {a.out}   (العتبة المقترحة: {thr:.2f})")
+    if not best:
+        print("تحذير: لا توجد عتبة تعطي متوسط ربح موجب بعد السبريد. لا تستخدم هذا النموذج للتداول.")
+
+
+
+# ---------------------------------------------------------------- المحرك
+class GoldSignalEngine:
+    def __init__(self, model_path="gold_model.joblib", tf_min=None, threshold=None,
+                 entry_score=76.0, max_spread=None):
+        """
+        tf_min      : إطار شموع البوت بالدقائق (BOT_TF_MIN). يُقارَن بإطار التدريب ويُرفع خطأ عند الاختلاف.
+        threshold   : عتبة الاحتمال. الافتراضي هو العتبة المحفوظة مع النموذج.
+        entry_score : قيمة ENTRY_CONFIDENCE في بوتك؛ تُستخدم لتحويل الإشارة إلى "قناعة" تتجاوز بوابة الدخول.
+        """
+        m = joblib.load(model_path)
+        self.model_long, self.model_short = m["model_long"], m["model_short"]
+        self.features = m["features"]
+        self.threshold = float(threshold if threshold is not None else m["threshold"])
+        self.tp_mult, self.sl_mult = float(m["tp_mult"]), float(m["sl_mult"])
+        self.horizon = int(m["horizon"])
+        self.train_tf = m.get("timeframe", "?")
+        self.entry_score = float(entry_score)
+        if tf_min is not None and TF_MAP.get(str(self.train_tf).upper()) not in (None, int(tf_min)):
+            raise ValueError(
+                f"إطار النموذج {self.train_tf} لا يطابق إطار البوت {tf_min} دقيقة. "
+                f"أعد التدريب على بيانات بنفس الإطار."
+            )
+
+    # بناء القرار بنفس شكل قرار البوت (policy/direction/score/reason/trigger_low/trigger_high/confirmed)
+    def evaluate(self, closed_candles):
+        base = {"policy": "ML_TRIPLE_BARRIER", "direction": 0, "score": 0.0, "reason": "",
+                "z_score": 0.0, "short_drift": 0.0, "smc_event": "NONE",
+                "trigger_low": 0.0, "trigger_high": 0.0, "confirmed": False, "ready": False,
+                "p_long": 0.0, "p_short": 0.0, "atr": 0.0, "sl_dist": 0.0, "tp_dist": 0.0}
+
+        if closed_candles is None or len(closed_candles) < MIN_ROWS:
+            n = 0 if closed_candles is None else len(closed_candles)
+            base["reason"] = f"النموذج ينتظر بيانات كافية ({n}/{MIN_ROWS} شمعة مغلقة)"
+            return base
+
+        df = _ml_to_frame(list(closed_candles)[-400:])
+        feats, atr = ml_make_features(df)
+        row = feats.iloc[[-1]][self.features]
+        last_atr = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
+        if row.isna().any(axis=None) or last_atr <= 0:
+            base["reason"] = "ميزات غير مكتملة في آخر شمعة"
+            return base
+
+        pl = float(self.model_long.predict_proba(row)[0, 1])
+        ps = float(self.model_short.predict_proba(row)[0, 1])
+        thr = self.threshold
+
+        direction = 0
+        if pl > thr and pl >= ps:
+            direction = 1
+        elif ps > thr and ps > pl:
+            direction = -1
+
+        if direction != 0:
+            p = pl if direction == 1 else ps
+            score = round(min(98.0, self.entry_score + min(20.0, (p - thr) * 100.0)), 1)
+            side = "شراء" if direction == 1 else "بيع"
+            reason = f"إشارة النموذج: {side} (احتمال {p:.1%} > العتبة {thr:.0%})"
+        else:
+            score = round(min(self.entry_score - 0.1, max(pl, ps) * 100.0), 1)
+            reason = f"لا ميزة كافية: شراء {pl:.1%} | بيع {ps:.1%} (العتبة {thr:.0%})"
+
+        last = df.iloc[-1]
+        base.update({
+            "direction": direction, "score": score, "reason": reason,
+            "trigger_low": float(last["low"]), "trigger_high": float(last["high"]),
+            "confirmed": direction != 0, "ready": True,
+            "p_long": round(pl, 4), "p_short": round(ps, 4), "atr": round(last_atr, 3),
+            "sl_dist": round(self.sl_mult * last_atr, 2), "tp_dist": round(self.tp_mult * last_atr, 2),
+        })
+        return base
+
+    @staticmethod
+    def levels(side, entry, sl_dist, tp_dist):
+        """side = 'BUY' أو 'SELL' → (SL, TP) كأسعار."""
+        if side == "BUY":
+            return round(entry - sl_dist, 2), round(entry + tp_dist, 2)
+        return round(entry + sl_dist, 2), round(entry - tp_dist, 2)
+
+
+
+
+ML_ENGINE = None
+ML_STATUS = "نموذج ML غير محمّل: يعمل البوت باستراتيجيته الأصلية"
+if os.path.exists(ML_MODEL_PATH):
+    try:
+        if not ML_DEPS_OK:
+            raise RuntimeError("المكتبات المطلوبة غير مثبتة: pip install pandas scikit-learn joblib")
+        ML_ENGINE = GoldSignalEngine(ML_MODEL_PATH, tf_min=TF_MIN, entry_score=ENTRY_CONFIDENCE)
+        ML_STATUS = f"نموذج ML مفعّل ({ML_ENGINE.train_tf} | عتبة {ML_ENGINE.threshold:.2f})"
+    except Exception as _e:
+        ML_STATUS = f"تعذّر تحميل نموذج ML ({_e}) — الاستراتيجية الأصلية تعمل"
+print("[ML]", ML_STATUS)
 
 
 # ==============================================================================
@@ -378,6 +771,7 @@ class AutonomousQuantitativeBrain:
         self._analysis_ts: Optional[int] = None
         self._decision: Dict = {"policy": "CALIBRATING", "direction": 0, "score": 0.0}
         self._restore_state()
+        self.log_thought(ML_STATUS, "SYSTEM")
 
     def _save_runtime_key(self, key: str, val_obj):
         try:
@@ -1048,6 +1442,10 @@ class AutonomousQuantitativeBrain:
         self.discover_gravity_and_volume_profile(opens[-140:], closes[-140:], highs[-140:], lows[-140:])
 
         self._decision = self.synthesize_optimal_policy(times, opens, highs, lows, closes)
+        if ML_ENGINE is not None:
+            sig = ML_ENGINE.evaluate(closed)
+            if sig["ready"]:
+                self._decision = sig
         self.active_policy = self._decision["policy"]
         self.confidence = self._decision["score"]
 
@@ -1131,6 +1529,12 @@ class AutonomousQuantitativeBrain:
         - الهدف يوضع عند المحطة الهيكلية المقابلة في السوق (POC / VAH / VAL / KDE Zone / Opposite Swing)
           بشرط أن تمنح عائداً للمخاطرة >= 1.85R لتعويض أي ستوب سابق.
         """
+        if decision.get("policy") == "ML_TRIPLE_BARRIER":
+            sl_d, tp_d = round(decision["sl_dist"], 2), round(decision["tp_dist"], 2)
+            rr = round(tp_d / sl_d, 2)
+            if side == "BUY":
+                return round(entry - sl_d, 2), round(entry + tp_d, 2), sl_d, "ML_ATR_TARGET", rr
+            return round(entry + sl_d, 2), round(entry - tp_d, 2), sl_d, "ML_ATR_TARGET", rr
         closed = list(self.candles)[:-1]
         recent_10 = closed[-10:] if len(closed) >= 10 else closed
         atr = max(0.7, self.atr_value)
@@ -3236,3 +3640,23 @@ HTML_UI = """<!DOCTYPE html>
 @app.get("/", response_class=HTMLResponse)
 async def serve_terminal():
     return HTMLResponse(content=HTML_UI)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        ml_train_main(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "check":
+        _ap = argparse.ArgumentParser()
+        _ap.add_argument("--csv", required=True)
+        _ap.add_argument("--last", type=int, default=10)
+        _a = _ap.parse_args(sys.argv[2:])
+        if ML_ENGINE is None:
+            sys.exit(ML_STATUS)
+        _d = ml_load_csv(_a.csv)
+        _ep = (_d["time"] - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
+        _recs = _d.assign(time=_ep.astype("int64")).to_dict("records")
+        for _i in range(len(_recs) - _a.last, len(_recs)):
+            _s = ML_ENGINE.evaluate(_recs[: _i + 1])
+            print(pd.to_datetime(_recs[_i]["time"], unit="s"), _s["direction"], _s["score"], _s["reason"])
+    else:
+        print("للتشغيل:  uvicorn app:app --host 0.0.0.0 --port 8000\nللتدريب: python app.py train --csv ملف.csv --tf M15 --utc-offset 3")
