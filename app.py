@@ -44,7 +44,7 @@ MEXC_KLINE_URL = f"{MEXC_BASE_URL}/kline/XAU_USDT"
 MEXC_DEPTH_URL = f"{MEXC_BASE_URL}/depth/XAU_USDT"
 MEXC_TICKER_URL = f"{MEXC_BASE_URL}/ticker?symbol=XAU_USDT"
 
-# مصدر احتياطي سويس كوت في حال غياب أو انقطاع الاتصال
+# مصدر احتياطي سويس كوت
 SQ_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
 SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()
 
@@ -1994,7 +1994,6 @@ class MEXCLiveGoldStream:
             return
 
         async with self.brain.lock:
-            # إزالة التكرار وفرز الشموع زمنياً
             seen = set()
             clean = []
             for c in hist:
