@@ -1,5 +1,7 @@
 import asyncio
+import hmac
 import json
+import math
 import os
 import sqlite3
 import time
@@ -44,12 +46,10 @@ MEXC_KLINE_URL = f"{MEXC_BASE_URL}/kline/XAU_USDT"
 MEXC_DEPTH_URL = f"{MEXC_BASE_URL}/depth/XAU_USDT"
 MEXC_TICKER_URL = f"{MEXC_BASE_URL}/ticker?symbol=XAU_USDT"
 
-# مصدر احتياطي سويس كوت
-SQ_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
-SQ_PROFILE = os.getenv("SQ_PROFILE", "standard").lower()
+# رمز الدخول للوحة التحكم (WebSocket). إن تُرك فارغاً تكون اللوحة مفتوحة — لا يُنصح بذلك خارج الجهاز المحلي.
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
 
 POLL_S = 1.5
-STALE_QUOTE_S = 120
 TF_MIN = int(os.getenv("BOT_TF_MIN", "1"))
 _MEXC_INTERVALS = {1: "Min1", 5: "Min5", 15: "Min15", 30: "Min30", 60: "Min60"}
 MEXC_INTERVAL = _MEXC_INTERVALS.get(TF_MIN, "Min1")
@@ -79,6 +79,23 @@ STAGNATION_EXIT_S = 900 * TF_MIN
 AUTO_RETRAIN_INTERVAL_S = 3600
 
 
+_BG_TASKS: set = set()
+
+
+def spawn(coro) -> "asyncio.Task":
+    """create_task مع الاحتفاظ بمرجع للمهمة (لمنع جمعها من الذاكرة) وتسجيل أي استثناء."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+
+    def _done(t: "asyncio.Task"):
+        _BG_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            print("Background task error:", repr(t.exception()))
+
+    task.add_done_callback(_done)
+    return task
+
+
 def stamp() -> str:
     return datetime.now(timezone.utc).strftime("%m-%d %H:%M:%S")
 
@@ -90,7 +107,7 @@ def today_utc_str() -> str:
 def get_active_session() -> Dict[str, str]:
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour + now_utc.minute / 60.0
-    if 20.5 <= h < 22.15:
+    if 20.5 <= h < (22.0 + 10.0 / 60.0):
         return {
             "name": "DEADZONE_ROLLOVER",
             "label": "حظر الـ Rollover اليومي (20:30-22:10 UTC)",
@@ -109,7 +126,13 @@ def get_active_session() -> Dict[str, str]:
 # 1. محرك قاعدة البيانات الدائمة (SQLite WAL Engine)
 # ==============================================================================
 def get_db_conn() -> sqlite3.Connection:
+    first = not os.path.exists(DB_PATH)
     conn = sqlite3.connect(DB_PATH, timeout=12.0)
+    if first:
+        try:
+            os.chmod(DB_PATH, 0o600)  # القاعدة قد تحوي توكن تلغرام: قراءة للمالك فقط
+        except OSError:
+            pass
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
@@ -290,6 +313,10 @@ class AutoSelfLearningEngine:
             return
         try:
             m = joblib.load(self.model_path)
+            saved_tf = m.get("timeframe")
+            if saved_tf and saved_tf != f"M{TF_MIN}":
+                self.status_text = f"نموذج محفوظ لإطار {saved_tf} مختلف عن M{TF_MIN} — إعادة تدريب"
+                return
             self.model_long = m["model_long"]
             self.model_short = m["model_short"]
             self.features = m["features"]
@@ -433,34 +460,21 @@ class TelegramNotifier:
             return
         icon = "🟢" if pos["side"] == "BUY" else "🔴"
         direction_ar = "شراء مؤسساتي (BUY)" if pos["side"] == "BUY" else "بيع مؤسساتي (SELL)"
-        ob_info = f"🏛️ <b>الأوردر بلوك:</b> <code>{pos.get('ob_tag', 'INSTITUTIONAL_OB')}</code>
-" if pos.get('ob_tag') else ""
+        ob_info = f"🏛️ <b>الأوردر بلوك:</b> <code>{pos.get('ob_tag', 'INSTITUTIONAL_OB')}</code>\n" if pos.get('ob_tag') else ""
         msg = (
-            f"{icon} <b>دخول صفقة ذهب مؤسساتية | XAU/USD (MEXC Futures)</b>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})
-"
-            f"📦 <b>حجم العقد:</b> <code>{pos['lots']:.2f} Lot</code>
-"
-            f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>
-"
-            f"🛡️ <b>الوقف خلف الـ OB/الهيكل (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})
-"
-            f"🏆 <b>الهدف المقابل (TP):</b> <code>${pos['tp']:.2f}</code> ({pos.get('target_rr', 3.0):.2f}R)
-"
-            f"🏛️ <b>محطة الهدف:</b> <code>{pos.get('tp_anchor', 'STRUCTURAL_ZONE')}</code>
-"
+            f"{icon} <b>دخول صفقة ذهب مؤسساتية | XAU/USD (MEXC Futures)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>العملية:</b> <code>{direction_ar}</code> (#{pos['id']})\n"
+            f"📦 <b>حجم العقد:</b> <code>{pos['lots']:.2f} Lot</code>\n"
+            f"🎯 <b>سعر الدخول:</b> <code>${pos['entry_price']:.2f}</code>\n"
+            f"🛡️ <b>الوقف خلف الـ OB/الهيكل (SL):</b> <code>${pos['sl']:.2f}</code> (مخاطرة: ${pos['risk_usd']:.2f})\n"
+            f"🏆 <b>الهدف المقابل (TP):</b> <code>${pos['tp']:.2f}</code> ({pos.get('target_rr', 3.0):.2f}R)\n"
+            f"🏛️ <b>محطة الهدف:</b> <code>{pos.get('tp_anchor', 'STRUCTURAL_ZONE')}</code>\n"
             f"{ob_info}"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"🧠 <b>القناعة:</b> <code>{pos['confidence']}%</code> | <b>السياسة:</b> <code>{pos['policy']}</code>
-"
-            f"📊 <b>ميزان السيولة (OBI):</b> <code>{pos.get('obi_val', '0.00')}</code>
-"
-            f"🌍 <b>الجلسة:</b> {session_label}
-"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 <b>القناعة:</b> <code>{pos['confidence']}%</code> | <b>السياسة:</b> <code>{pos['policy']}</code>\n"
+            f"📊 <b>ميزان السيولة (OBI):</b> <code>{pos.get('obi_val', '0.00')}</code>\n"
+            f"🌍 <b>الجلسة:</b> {session_label}\n"
             f"🕒 <b>التوقيت:</b> <code>{pos['opened_at']} UTC</code>"
         )
         await self.send_html(msg)
@@ -469,16 +483,11 @@ class TelegramNotifier:
         if not self.is_configured():
             return
         msg = (
-            f"🛡️ <b>تأمين صفقة نشطة | XAU/USD (#{pos['id']})</b>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"📌 <b>النوع:</b> <code>{pos['side']} ({pos['lots']:.2f}L)</code>
-"
-            f"🔒 <b>الوقف المحدث (SL):</b> <code>${pos['sl']:.2f}</code>
-"
-            f"💵 <b>الربح المحجوز/الجزئي:</b> <code>${pos['realized']:+.2f}</code>
-"
+            f"🛡️ <b>تأمين صفقة نشطة | XAU/USD (#{pos['id']})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>النوع:</b> <code>{pos['side']} ({pos['lots']:.2f}L)</code>\n"
+            f"🔒 <b>الوقف المحدث (SL):</b> <code>${pos['sl']:.2f}</code>\n"
+            f"💵 <b>الربح المحجوز/الجزئي:</b> <code>${pos['realized']:+.2f}</code>\n"
             f"📝 <b>التفاصيل:</b> {note}"
         )
         await self.send_html(msg)
@@ -491,26 +500,16 @@ class TelegramNotifier:
         pnl_str = f"+${rec['pnl']:.2f}" if win else f"-${abs(rec['pnl']):.2f}"
         r_str = f"{r_mult:+.2f}R"
         msg = (
-            f"{badge} | <b>XAU/USD (#{rec['id']})</b>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"📌 <b>الاتجاه والعقد:</b> <code>{rec['side']} ({rec['lots']:.2f} Lot)</code>
-"
-            f"📥 <b>سعر الدخول:</b> <code>${rec['entry_price']:.2f}</code>
-"
-            f"📤 <b>سعر الخروج:</b> <code>${rec['exit_price']:.2f}</code>
-"
-            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_str})</code>
-"
-            f"📝 <b>سبب الخروج:</b> {rec['reason_exit']}
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"🏦 <b>الرصيد المحدث:</b> <code>${balance:,.2f}</code>
-"
-            f"📈 <b>نسبة النجاح الكلية:</b> <code>{kpis['win_rate']}% ({kpis['wins']}W/{kpis['losses']}L)</code>
-"
+            f"{badge} | <b>XAU/USD (#{rec['id']})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>الاتجاه والعقد:</b> <code>{rec['side']} ({rec['lots']:.2f} Lot)</code>\n"
+            f"📥 <b>سعر الدخول:</b> <code>${rec['entry_price']:.2f}</code>\n"
+            f"📤 <b>سعر الخروج:</b> <code>${rec['exit_price']:.2f}</code>\n"
+            f"💰 <b>الصافي النهائي:</b> <code>{pnl_str} ({r_str})</code>\n"
+            f"📝 <b>سبب الخروج:</b> {rec['reason_exit']}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 <b>الرصيد المحدث:</b> <code>${balance:,.2f}</code>\n"
+            f"📈 <b>نسبة النجاح الكلية:</b> <code>{kpis['win_rate']}% ({kpis['wins']}W/{kpis['losses']}L)</code>\n"
             f"🕒 <b>وقت الإغلاق:</b> <code>{rec['closed_at']} UTC</code>"
         )
         await self.send_html(msg)
@@ -524,33 +523,20 @@ class TelegramNotifier:
         weights_txt = " | ".join([f"{k.split('_')[0]}: {v}x" for k, v in report["weights"].items()])
 
         msg = (
-            f"📊 <b>التقرير اليومي لإغلاق سوق الذهب | XAU/USD (MEXC)</b>
-"
-            f"📅 <b>التاريخ:</b> <code>{report['date']}</code>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
+            f"📊 <b>التقرير اليومي لإغلاق سوق الذهب | XAU/USD (MEXC)</b>\n"
+            f"📅 <b>التاريخ:</b> <code>{report['date']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
             f"🔢 <b>صفقات اليوم:</b> <code>{report['daily_total']}</code> "
-            f"(رابحة: <code>{report['daily_wins']}</code> | خاسرة: <code>{report['daily_losses']}</code>)
-"
-            f"🎯 <b>نسبة نجاح اليوم:</b> <code>{report['daily_win_rate']}%</code>
-"
-            f"{net_icon} <b>صافي ربح/خسارة اليوم:</b> <code>{net_str} ({report['daily_return_pct']:+.2f}%)</code>
-"
-            f"🏆 <b>أفضل صفقة اليوم:</b> <code>+${report['best_trade']:.2f}</code>
-"
-            f"⚠️ <b>أسوأ صفقة اليوم:</b> <code>${report['worst_trade']:.2f}</code>
-"
-            f"━━━━━━━━━━━━━━━━━━
-"
-            f"🏦 <b>إجمالي الرصيد الحالي:</b> <code>${report['balance']:,.2f}</code>
-"
-            f"📈 <b>إجمالي الصافي الكلي:</b> <code>${report['total_net_pnl']:+,.2f}</code>
-"
-            f"🛡️ <b>أقصى سحب مسجل (Max DD):</b> <code>{report['max_dd_pct']:.2f}%</code>
-"
-            f"⚖️ <b>أوزان التعلم الذاتي:</b>
-<code>{weights_txt}</code>"
+            f"(رابحة: <code>{report['daily_wins']}</code> | خاسرة: <code>{report['daily_losses']}</code>)\n"
+            f"🎯 <b>نسبة نجاح اليوم:</b> <code>{report['daily_win_rate']}%</code>\n"
+            f"{net_icon} <b>صافي ربح/خسارة اليوم:</b> <code>{net_str} ({report['daily_return_pct']:+.2f}%)</code>\n"
+            f"🏆 <b>أفضل صفقة اليوم:</b> <code>+${report['best_trade']:.2f}</code>\n"
+            f"⚠️ <b>أسوأ صفقة اليوم:</b> <code>${report['worst_trade']:.2f}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 <b>إجمالي الرصيد الحالي:</b> <code>${report['balance']:,.2f}</code>\n"
+            f"📈 <b>إجمالي الصافي الكلي:</b> <code>${report['total_net_pnl']:+,.2f}</code>\n"
+            f"🛡️ <b>أقصى سحب مسجل (Max DD):</b> <code>{report['max_dd_pct']:.2f}%</code>\n"
+            f"⚖️ <b>أوزان التعلم الذاتي:</b>\n<code>{weights_txt}</code>"
         )
         return await self.send_html(msg, force=force)
 
@@ -819,8 +805,10 @@ class AutonomousQuantitativeBrain:
                         self.tg.last_report_date = str(parsed)
 
                 c.execute(
+                    "SELECT time, open, high, low, close, volume FROM ("
                     "SELECT time, open, high, low, close, volume FROM market_candles "
-                    "WHERE tf_min = ? ORDER BY time ASC LIMIT 1500",
+                    "WHERE tf_min = ? ORDER BY time DESC LIMIT 1500"
+                    ") ORDER BY time ASC",
                     (TF_MIN,),
                 )
                 saved_candles = [
@@ -830,6 +818,13 @@ class AutonomousQuantitativeBrain:
                     }
                     for r in c.fetchall()
                 ]
+                if self.open_position:
+                    banked = float(self.open_position.get("realized", 0.0) or 0.0)
+                    if banked:
+                        self.balance = round(self.balance + banked, 2)
+                        self.equity = self.balance
+                        self.peak_balance = max(self.peak_balance, self.balance)
+
                 if saved_candles:
                     self.candles.extend(saved_candles)
                     if len(saved_candles) >= 120:
@@ -851,9 +846,9 @@ class AutonomousQuantitativeBrain:
     def update_lot_settings(self, lot_mode: Optional[str] = None, fixed_lot: Optional[float] = None, risk_pct: Optional[float] = None):
         if lot_mode in ("FIXED", "DYNAMIC_RISK"):
             self.lot_mode = lot_mode
-        if fixed_lot is not None:
+        if fixed_lot is not None and math.isfinite(float(fixed_lot)):
             self.fixed_lot = round(float(np.clip(fixed_lot, 0.01, MAX_LOT_CAP)), 2)
-        if risk_pct is not None:
+        if risk_pct is not None and math.isfinite(float(risk_pct)):
             self.risk_pct = float(np.clip(risk_pct, 0.0020, 0.0300))
         self._save_runtime_key("lot_config", {
             "lot_mode": self.lot_mode,
@@ -910,7 +905,8 @@ class AutonomousQuantitativeBrain:
         self.tg.chat_id = chat_id.strip()
         self.tg.enabled = bool(enabled and self.tg.bot_token and self.tg.chat_id)
         self._save_runtime_key("telegram_config", {
-            "bot_token": self.tg.bot_token,
+            # التوكن القادم من متغير البيئة لا يُكرَّر داخل القاعدة
+            "bot_token": "" if (DEFAULT_TG_TOKEN and self.tg.bot_token == DEFAULT_TG_TOKEN) else self.tg.bot_token,
             "chat_id": self.tg.chat_id,
             "enabled": self.tg.enabled,
         })
@@ -1499,7 +1495,7 @@ class AutonomousQuantitativeBrain:
                 if closed_candles:
                     self.save_candle_to_db(closed_candles[-1])
                 self._analyze(closed_candles)
-                asyncio.create_task(self.trigger_background_learning(force=False))
+                spawn(self.trigger_background_learning(force=False))
 
             decision = self._decision
 
@@ -1823,7 +1819,7 @@ class AutonomousQuantitativeBrain:
             "EXIT_DECISION",
         )
         await self.tg.notify_exit(record, r_result, self.balance, self.get_kpi_metrics())
-        asyncio.create_task(self.trigger_background_learning(force=True))
+        spawn(self.trigger_background_learning(force=True))
 
     def _persist_trade_and_lesson(self, rec: Dict, policy_name: str):
         conn = get_db_conn()
@@ -1893,8 +1889,9 @@ class MEXCLiveGoldStream:
         self.market_open: bool = True
         self.last_poll: float = 0.0
         self.last_good_ts: float = 0.0
-        self.hist_loaded: bool = len(brain_ref.candles) >= 120
+        self.hist_loaded: bool = False  # دائماً أعد التحميل عند الإقلاع: شموع القاعدة قد تكون قديمة
         self.last_hist_try: float = 0.0
+        self._last_bucket: int = 0
         self._client: Optional[httpx.AsyncClient] = None
 
     def _http(self) -> httpx.AsyncClient:
@@ -1912,8 +1909,8 @@ class MEXCLiveGoldStream:
                     d = res["data"]
                     bid = float(d.get("bid1", d.get("lastPrice", 0)))
                     ask = float(d.get("ask1", d.get("lastPrice", 0)))
-                    mid = float(d.get("lastPrice", (bid + ask) / 2.0))
-                    if bid > 100 and ask > 100:
+                    if bid > 100 and ask > 100 and ask >= bid:
+                        mid = (bid + ask) / 2.0
                         return bid, ask, mid
         except Exception:
             pass
@@ -2016,7 +2013,7 @@ class MEXCLiveGoldStream:
                     f"تم تحميل {len(clean)} شمعة فيوتشر حقيقية من MEXC (مع الفوليوم الفعلي والـ OBs).",
                     "PERCEPTION",
                 )
-                asyncio.create_task(self.brain.trigger_background_learning(force=True))
+                spawn(self.brain.trigger_background_learning(force=True))
 
         if self.clients:
             await self._broadcast(self.build_payload("INIT_SNAPSHOT", full=True))
@@ -2037,7 +2034,26 @@ class MEXCLiveGoldStream:
             last["high"] = price
         if price < last["low"]:
             last["low"] = price
-        last["volume"] = last.get("volume", 0.0) + 1.0
+        if not last.get("vol_real"):
+            last["volume"] = last.get("volume", 0.0) + 1.0  # حجم تقريبي بعدد النبضات حتى تصل قيمة MEXC الحقيقية
+
+    async def _sync_recent_volume(self):
+        """استبدال حجم/أسعار آخر الشموع المحلية بقيم MEXC الحقيقية كي لا يُخلط حجم النبضات بحجم العقود."""
+        fresh = await self._fetch_mexc_history()
+        if not fresh:
+            return
+        by_time = {c["time"]: c for c in fresh[-12:]}
+        async with self.brain.lock:
+            candles = self.brain.candles
+            for i, c in enumerate(candles):
+                src = by_time.get(c["time"])
+                if not src:
+                    continue
+                c["volume"] = src["volume"]
+                c["vol_real"] = True
+                if i < len(candles) - 1:  # الشمعة المغلقة تأخذ OHLC الرسمي
+                    c["open"], c["high"], c["low"], c["close"] = src["open"], src["high"], src["low"], src["close"]
+                    self.brain.save_candle_to_db(c)
 
     async def run_stream_loop(self):
         try:
@@ -2058,6 +2074,10 @@ class MEXCLiveGoldStream:
         b = self.brain
         now = time.time()
         bucket = (int(now) // TF_SEC) * TF_SEC
+        if bucket != self._last_bucket:
+            if self._last_bucket and self.hist_loaded:
+                spawn(self._sync_recent_volume())
+            self._last_bucket = bucket
 
         if now - self.last_poll >= POLL_S:
             self.last_poll = now
@@ -2210,6 +2230,11 @@ app = FastAPI(title="Autonomous XAU/USD Institutional Sniper Cockpit v8", lifesp
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if DASHBOARD_TOKEN and not hmac.compare_digest(
+        str(ws.query_params.get("token", "")).encode(), DASHBOARD_TOKEN.encode()
+    ):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     try:
         await ws.send_json(stream_manager.build_payload("INIT_SNAPSHOT", full=True))
@@ -2222,82 +2247,78 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
             cmd = data.get("command") if isinstance(data, dict) else None
             async with brain.lock:
-                if cmd == "TOGGLE_BOT":
-                    brain.bot_active = not brain.bot_active
-                    state_txt = "مُفعّل ومستقل" if brain.bot_active else "مُتوقف مؤقتاً"
-                    brain.log_thought(f"تم تغيير حالة الوكيل يدوياً إلى: {state_txt}", "SYSTEM")
+                try:
+                    if cmd == "TOGGLE_BOT":
+                        brain.bot_active = not brain.bot_active
+                        state_txt = "مُفعّل ومستقل" if brain.bot_active else "مُتوقف مؤقتاً"
+                        brain.log_thought(f"تم تغيير حالة الوكيل يدوياً إلى: {state_txt}", "SYSTEM")
 
-                elif cmd == "TOGGLE_LOT_MODE":
-                    new_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED" else "FIXED"
-                    brain.update_lot_settings(lot_mode=new_mode)
-                    mode_lbl = f"{brain.fixed_lot:.2f} لوت ثابت" if brain.lot_mode == "FIXED" else f"مخاطرة ديناميكية ({brain.risk_pct*100:.2f}%)"
-                    brain.log_thought(f"تم تبديل وضع العقد إلى: {mode_lbl}", "SYSTEM")
+                    elif cmd == "TOGGLE_LOT_MODE":
+                        new_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED" else "FIXED"
+                        brain.update_lot_settings(lot_mode=new_mode)
+                        mode_lbl = f"{brain.fixed_lot:.2f} لوت ثابت" if brain.lot_mode == "FIXED" else f"مخاطرة ديناميكية ({brain.risk_pct*100:.2f}%)"
+                        brain.log_thought(f"تم تبديل وضع العقد إلى: {mode_lbl}", "SYSTEM")
 
-                elif cmd == "ADJUST_LOT":
-                    step = float(data.get("step", 0.0))
-                    exact = data.get("exact")
-                    new_lot = float(exact) if exact is not None else round(brain.fixed_lot + step, 2)
-                    brain.update_lot_settings(lot_mode="FIXED", fixed_lot=new_lot)
-                    brain.log_thought(f"تم ضبط حجم اللوت الثابت على: {brain.fixed_lot:.2f} Lot", "SYSTEM")
+                    elif cmd == "ADJUST_LOT":
+                        step = float(data.get("step", 0.0))
+                        exact = data.get("exact")
+                        new_lot = float(exact) if exact is not None else round(brain.fixed_lot + step, 2)
+                        brain.update_lot_settings(lot_mode="FIXED", fixed_lot=new_lot)
+                        brain.log_thought(f"تم ضبط حجم اللوت الثابت على: {brain.fixed_lot:.2f} Lot", "SYSTEM")
 
-                elif cmd == "SET_RISK_PCT":
-                    pct = float(data.get("risk_pct", 0.5)) / 100.0
-                    brain.update_lot_settings(lot_mode="DYNAMIC_RISK", risk_pct=pct)
-                    brain.log_thought(f"تم تفعيل المخاطرة الديناميكية بنسبة: {brain.risk_pct*100:.2f}%", "SYSTEM")
+                    elif cmd == "SET_RISK_PCT":
+                        pct = float(data.get("risk_pct", 0.5)) / 100.0
+                        brain.update_lot_settings(lot_mode="DYNAMIC_RISK", risk_pct=pct)
+                        brain.log_thought(f"تم تفعيل المخاطرة الديناميكية بنسبة: {brain.risk_pct*100:.2f}%", "SYSTEM")
 
-                elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
-                    await brain._close_position(
-                        brain._exit_quote(brain.open_position["side"]),
-                        "إغلاق فوري بطلب المالك (Manual Emergency Exit)",
-                    )
+                    elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
+                        await brain._close_position(
+                            brain._exit_quote(brain.open_position["side"]),
+                            "إغلاق فوري بطلب المالك (Manual Emergency Exit)",
+                        )
 
-                elif cmd == "RELOAD_HISTORY":
-                    stream_manager.hist_loaded = False
-                    asyncio.create_task(stream_manager._load_history())
-                    brain.log_thought("جاري إعادة مزامنة شموع فيوتشر MEXC والأوردر بلوك...", "SYSTEM")
+                    elif cmd == "RELOAD_HISTORY":
+                        stream_manager.hist_loaded = False
+                        spawn(stream_manager._load_history())
+                        brain.log_thought("جاري إعادة مزامنة شموع فيوتشر MEXC والأوردر بلوك...", "SYSTEM")
 
-                elif cmd == "TRAIN_NOW":
-                    asyncio.create_task(brain.trigger_background_learning(force=True))
-                    brain.log_thought("بدأ التدريب الفوري لنموذج Auto-ML على بيانات فيوتشر MEXC...", "SYSTEM")
+                    elif cmd == "TRAIN_NOW":
+                        spawn(brain.trigger_background_learning(force=True))
+                        brain.log_thought("بدأ التدريب الفوري لنموذج Auto-ML على بيانات فيوتشر MEXC...", "SYSTEM")
 
-                elif cmd == "SAVE_TELEGRAM":
-                    token = str(data.get("bot_token", "")).strip()
-                    chat_id = str(data.get("chat_id", "")).strip()
-                    enabled = bool(data.get("enabled", True))
-                    brain.update_telegram_config(token, chat_id, enabled)
-                    brain.log_thought(f"تم تحديث إعدادات تلغرام ({brain.tg.last_status}).", "SYSTEM")
+                    elif cmd == "SAVE_TELEGRAM":
+                        token = str(data.get("bot_token", "")).strip()
+                        chat_id = str(data.get("chat_id", "")).strip()
+                        enabled = bool(data.get("enabled", True))
+                        brain.update_telegram_config(token, chat_id, enabled)
+                        brain.log_thought(f"تم تحديث إعدادات تلغرام ({brain.tg.last_status}).", "SYSTEM")
 
-                elif cmd == "TEST_TELEGRAM":
-                    test_msg = (
-                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Institutional Sniper v8</b>
-"
-                        "━━━━━━━━━━━━━━━━━━
-"
-                        f"✅ البوت متصل بقناتك بنجاح.
-"
-                        f"📡 <b>المصدر:</b> <code>MEXC Futures (XAU_USDT)</code>
-"
-                        f"💰 <b>الرصيد:</b> <code>${brain.balance:,.2f}</code>
-"
-                        f"📊 <b>سعر الذهب:</b> <code>${brain.last_price or 0.0:.2f}</code>
-"
-                        f"⚖️ <b>ميزان السيولة (OBI):</b> <code>{brain.order_book_imbalance:+.2f}</code>
-"
-                        f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
-                    )
-                    ok = await brain.tg.send_html(test_msg, force=True)
-                    brain.log_thought(
-                        "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
-                        "SYSTEM",
-                    )
+                    elif cmd == "TEST_TELEGRAM":
+                        test_msg = (
+                            "🔔 <b>اختبار اتصال ناجح | XAU/USD Institutional Sniper v8</b>\n"
+                            "━━━━━━━━━━━━━━━━━━\n"
+                            f"✅ البوت متصل بقناتك بنجاح.\n"
+                            f"📡 <b>المصدر:</b> <code>MEXC Futures (XAU_USDT)</code>\n"
+                            f"💰 <b>الرصيد:</b> <code>${brain.balance:,.2f}</code>\n"
+                            f"📊 <b>سعر الذهب:</b> <code>${brain.last_price or 0.0:.2f}</code>\n"
+                            f"⚖️ <b>ميزان السيولة (OBI):</b> <code>{brain.order_book_imbalance:+.2f}</code>\n"
+                            f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
+                        )
+                        ok = await brain.tg.send_html(test_msg, force=True)
+                        brain.log_thought(
+                            "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
+                            "SYSTEM",
+                        )
 
-                elif cmd == "SEND_DAILY_REPORT_NOW":
-                    report = brain.build_daily_report_data()
-                    ok = await brain.tg.send_daily_report(report, force=True)
-                    brain.log_thought(
-                        "تم إرسال التقرير اليومي إلى تلغرام." if ok else f"تعذر الإرسال: {brain.tg.last_status}",
-                        "SYSTEM",
-                    )
+                    elif cmd == "SEND_DAILY_REPORT_NOW":
+                        report = brain.build_daily_report_data()
+                        ok = await brain.tg.send_daily_report(report, force=True)
+                        brain.log_thought(
+                            "تم إرسال التقرير اليومي إلى تلغرام." if ok else f"تعذر الإرسال: {brain.tg.last_status}",
+                            "SYSTEM",
+                        )
+                except (ValueError, TypeError) as e:
+                    brain.log_thought(f"أمر مرفوض ({cmd}): قيمة غير صالحة — {e}", "SYSTEM")
 
             await stream_manager.broadcast_state()
     except WebSocketDisconnect:
@@ -2747,7 +2768,8 @@ HTML_UI = """<!DOCTYPE html>
         let timer;
         function connect() {
           const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-          const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+          const tk = new URLSearchParams(window.location.search).get('token') || '';
+          const ws = new WebSocket(`${proto}//${window.location.host}/ws${tk ? '?token=' + encodeURIComponent(tk) : ''}`);
           wsRef.current = ws;
 
           ws.onopen = () => setConnected(true);
@@ -2960,6 +2982,60 @@ HTML_UI = """<!DOCTYPE html>
         </div>
       );
 
+      const renderControlPanel = () => (
+        <div className="vision-card p-4 flex flex-col gap-3">
+          <h2 className="text-xs font-extrabold gold-gradient-text tracking-wide">لوحة التحكم</h2>
+
+          <div className="vision-pill p-3 space-y-2">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-slate-300">وضع العقد</span>
+              <button onClick={() => sendCommand('TOGGLE_LOT_MODE')}
+                className="apple-btn px-2.5 py-1 rounded-lg text-[11px] font-bold bg-white/5 border border-white/10 text-amber-300">
+                {state.lot_mode === 'FIXED' ? 'لوت ثابت' : 'مخاطرة ديناميكية'}
+              </button>
+            </div>
+            {state.lot_mode === 'FIXED' ? (
+              <div className="flex items-center justify-between">
+                <button onClick={() => sendCommand('ADJUST_LOT', { step: -0.01 })} className="apple-btn w-9 h-8 rounded-lg bg-white/5 border border-white/10 font-bold">-</button>
+                <span className="mono font-extrabold text-amber-300">{Number(state.fixed_lot).toFixed(2)} Lot</span>
+                <button onClick={() => sendCommand('ADJUST_LOT', { step: 0.01 })} className="apple-btn w-9 h-8 rounded-lg bg-white/5 border border-white/10 font-bold">+</button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between">
+                <button onClick={() => sendCommand('SET_RISK_PCT', { risk_pct: Math.max(0.2, Number(state.risk_pct) - 0.1) })} className="apple-btn w-9 h-8 rounded-lg bg-white/5 border border-white/10 font-bold">-</button>
+                <span className="mono font-extrabold text-amber-300">{Number(state.risk_pct).toFixed(2)}%</span>
+                <button onClick={() => sendCommand('SET_RISK_PCT', { risk_pct: Math.min(3, Number(state.risk_pct) + 0.1) })} className="apple-btn w-9 h-8 rounded-lg bg-white/5 border border-white/10 font-bold">+</button>
+              </div>
+            )}
+          </div>
+
+          <button onClick={() => sendCommand('TRAIN_NOW')}
+            className="apple-btn px-3 py-2 rounded-xl text-[11px] font-bold bg-white/5 border border-white/10 text-sky-300">
+            🧠 تدريب Auto-ML الآن
+          </button>
+
+          <form onSubmit={saveTelegramSettings} className="vision-pill p-3 space-y-2">
+            <div className="text-[11px] font-bold text-slate-200">إعدادات تلغرام</div>
+            <input type="password" autoComplete="off" value={tgTokenInput} onChange={(e) => setTgTokenInput(e.target.value)}
+              placeholder={tg.masked_token ? `التوكن الحالي: ${tg.masked_token}` : 'Bot Token'}
+              className="w-full px-2.5 py-1.5 rounded-lg bg-black/30 border border-white/10 text-[11px] mono text-slate-100 outline-none" />
+            <input type="text" value={tgChatInput} onChange={(e) => setTgChatInput(e.target.value)}
+              placeholder="Chat ID"
+              className="w-full px-2.5 py-1.5 rounded-lg bg-black/30 border border-white/10 text-[11px] mono text-slate-100 outline-none" />
+            <label className="flex items-center gap-2 text-[11px] text-slate-300">
+              <input type="checkbox" checked={tgEnabledInput} onChange={(e) => setTgEnabledInput(e.target.checked)} />
+              تفعيل الإشعارات
+            </label>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <button type="submit" className="apple-btn px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">حفظ</button>
+              <button type="button" onClick={() => sendCommand('TEST_TELEGRAM')} className="apple-btn px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-white/5 text-slate-200 border border-white/10">اختبار</button>
+              <button type="button" onClick={() => sendCommand('SEND_DAILY_REPORT_NOW')} className="apple-btn px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-white/5 text-slate-200 border border-white/10">تقرير اليوم</button>
+            </div>
+            <p className="text-[10px] text-slate-400">{tg.last_status}</p>
+          </form>
+        </div>
+      );
+
       const renderNeuralStream = () => (
         <div className="vision-card p-4 flex-1 flex flex-col min-h-[260px]">
           <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-white/[0.06]">
@@ -3143,6 +3219,7 @@ HTML_UI = """<!DOCTYPE html>
 
               <div className="lg:col-span-4 flex flex-col gap-3.5">
                 {renderCortexPanel()}
+                {renderControlPanel()}
                 {renderNeuralStream()}
               </div>
             </div>
@@ -3166,5 +3243,7 @@ async def serve_terminal():
 
 
 if __name__ == "__main__":
+    if not DASHBOARD_TOKEN:
+        print("WARNING: DASHBOARD_TOKEN غير مضبوط — أي شخص يصل للمنفذ يستطيع التحكم بالبوت.")
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
