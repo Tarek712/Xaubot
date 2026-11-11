@@ -1,3 +1,37 @@
+import os
+import sys
+import subprocess
+
+# ==============================================================================
+# تهيئة بيئة استضافة bot-hosting.net وتجاوز حظر الصلاحيات على .local
+# ==============================================================================
+CONTAINER_ROOT = "/home/container"
+PACKAGE_DIR = "/home/container/packages" if os.path.exists(CONTAINER_ROOT) else os.path.abspath("./packages")
+
+os.makedirs(PACKAGE_DIR, exist_ok=True)
+for _p in (PACKAGE_DIR, CONTAINER_ROOT):
+    if os.path.exists(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+os.environ["PYTHONPATH"] = f"{PACKAGE_DIR}:{CONTAINER_ROOT}:" + os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONUSERBASE"] = PACKAGE_DIR
+
+try:
+    import setup_packages
+    setup_packages.install_dependencies()
+except Exception:
+    for _pkg in ("fastapi", "uvicorn", "websockets", "wsproto", "httpx", "numpy"):
+        try:
+            __import__(_pkg)
+        except ImportError:
+            try:
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install",
+                    "--no-cache-dir", f"--target={PACKAGE_DIR}", _pkg
+                ])
+            except Exception as _e:
+                print(f"Auto-install warning ({_pkg}):", repr(_e))
+
 import asyncio
 import json
 import os
@@ -10,8 +44,8 @@ from typing import Dict, List, Optional
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # ==============================================================================
 # 0. إعدادات قابلة للتعديل ومعايير الهيكل السعري (100% Market-Driven Structure)
@@ -1878,6 +1912,84 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Autonomous XAU/USD Structural Sniper Cockpit v6", lifespan=lifespan)
 
 
+async def execute_user_command(data: Dict):
+    cmd = data.get("command") if isinstance(data, dict) else None
+    if not cmd:
+        return
+    async with brain.lock:
+        if cmd == "TOGGLE_BOT":
+            brain.bot_active = not brain.bot_active
+            state_txt = "مُفعّل ومستقل" if brain.bot_active else "مُتوقف مؤقتاً"
+            brain.log_thought(f"تم تغيير حالة الوكيل يدوياً إلى: {state_txt}", "SYSTEM")
+
+        elif cmd == "TOGGLE_LOT_MODE":
+            brain.lot_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED_001" else "FIXED_001"
+            brain._save_runtime_key("lot_mode", brain.lot_mode)
+            mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة محمية (0.35% سقف)"
+            brain.log_thought(f"تم تبديل حجم العقد إلى: {mode_lbl}", "SYSTEM")
+
+        elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
+            await brain._close_position(
+                brain._exit_quote(brain.open_position["side"]),
+                "إغلاق فوري بطلب المالك (Manual Emergency Exit)",
+            )
+
+        elif cmd == "RELOAD_HISTORY":
+            if brain.last_price:
+                stream_manager.hist_loaded = False
+                stream_manager.hist_tries = 0
+                asyncio.create_task(stream_manager._load_history(brain.last_price))
+                brain.log_thought("جاري إعادة مزامنة الشموع التاريخية من المصادر البديلة...", "SYSTEM")
+
+        elif cmd == "SAVE_TELEGRAM":
+            token = str(data.get("bot_token", "")).strip()
+            chat_id = str(data.get("chat_id", "")).strip()
+            enabled = bool(data.get("enabled", True))
+            brain.update_telegram_config(token, chat_id, enabled)
+            brain.log_thought(f"تم تحديث إعدادات إشعارات تلغرام ({brain.tg.last_status}).", "SYSTEM")
+
+        elif cmd == "TEST_TELEGRAM":
+            test_msg = (
+                "🔔 <b>اختبار اتصال ناجح | XAU/USD Structural Sniper v6</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.\n"
+                f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>\n"
+                f"📊 <b>سعر الذهب الحي:</b> <code>${brain.last_price or 0.0:.2f}</code>\n"
+                f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
+            )
+            ok = await brain.tg.send_html(test_msg, force=True)
+            brain.log_thought(
+                "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
+                "SYSTEM",
+            )
+
+        elif cmd == "SEND_DAILY_REPORT_NOW":
+            report = brain.build_daily_report_data()
+            ok = await brain.tg.send_daily_report(report, force=True)
+            brain.log_thought(
+                "تم إرسال التقرير اليومي إلى تلغرام يدوياً." if ok else f"تعذر إرسال التقرير اليومي: {brain.tg.last_status}",
+                "SYSTEM",
+            )
+
+    await stream_manager.broadcast_state()
+
+
+@app.get("/api/state")
+async def api_get_state(full: bool = False):
+    ptype = "INIT_SNAPSHOT" if full else "TICK_UPDATE"
+    return JSONResponse(stream_manager.build_payload(ptype, full=full))
+
+
+@app.post("/api/command")
+async def api_post_command(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+    await execute_user_command(data)
+    return JSONResponse(stream_manager.build_payload("TICK_UPDATE", full=False))
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -1890,63 +2002,7 @@ async def websocket_endpoint(ws: WebSocket):
                 data = json.loads(msg)
             except ValueError:
                 continue
-            cmd = data.get("command") if isinstance(data, dict) else None
-            async with brain.lock:
-                if cmd == "TOGGLE_BOT":
-                    brain.bot_active = not brain.bot_active
-                    state_txt = "مُفعّل ومستقل" if brain.bot_active else "مُتوقف مؤقتاً"
-                    brain.log_thought(f"تم تغيير حالة الوكيل يدوياً إلى: {state_txt}", "SYSTEM")
-
-                elif cmd == "TOGGLE_LOT_MODE":
-                    brain.lot_mode = "DYNAMIC_RISK" if brain.lot_mode == "FIXED_001" else "FIXED_001"
-                    brain._save_runtime_key("lot_mode", brain.lot_mode)
-                    mode_lbl = "0.01 لوت ثابت" if brain.lot_mode == "FIXED_001" else "مخاطرة محمية (0.35% سقف)"
-                    brain.log_thought(f"تم تبديل حجم العقد إلى: {mode_lbl}", "SYSTEM")
-
-                elif cmd == "PANIC_CLOSE" and brain.open_position is not None:
-                    await brain._close_position(
-                        brain._exit_quote(brain.open_position["side"]),
-                        "إغلاق فوري بطلب المالك (Manual Emergency Exit)",
-                    )
-
-                elif cmd == "RELOAD_HISTORY":
-                    if brain.last_price:
-                        stream_manager.hist_loaded = False
-                        stream_manager.hist_tries = 0
-                        asyncio.create_task(stream_manager._load_history(brain.last_price))
-                        brain.log_thought("جاري إعادة مزامنة الشموع التاريخية من المصادر البديلة...", "SYSTEM")
-
-                elif cmd == "SAVE_TELEGRAM":
-                    token = str(data.get("bot_token", "")).strip()
-                    chat_id = str(data.get("chat_id", "")).strip()
-                    enabled = bool(data.get("enabled", True))
-                    brain.update_telegram_config(token, chat_id, enabled)
-                    brain.log_thought(f"تم تحديث إعدادات إشعارات تلغرام ({brain.tg.last_status}).", "SYSTEM")
-
-                elif cmd == "TEST_TELEGRAM":
-                    test_msg = (
-                        "🔔 <b>اختبار اتصال ناجح | XAU/USD Structural Sniper v6</b>\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        f"✅ البوت متصل الآن بقناتك/حسابك بنجاح.\n"
-                        f"💰 <b>الرصيد الحالي:</b> <code>${brain.balance:,.2f}</code>\n"
-                        f"📊 <b>سعر الذهب الحي:</b> <code>${brain.last_price or 0.0:.2f}</code>\n"
-                        f"🕒 <b>التوقيت:</b> <code>{stamp()} UTC</code>"
-                    )
-                    ok = await brain.tg.send_html(test_msg, force=True)
-                    brain.log_thought(
-                        "تم إرسال رسالة اختبار تلغرام بنجاح." if ok else f"فشل اختبار تلغرام: {brain.tg.last_status}",
-                        "SYSTEM",
-                    )
-
-                elif cmd == "SEND_DAILY_REPORT_NOW":
-                    report = brain.build_daily_report_data()
-                    ok = await brain.tg.send_daily_report(report, force=True)
-                    brain.log_thought(
-                        "تم إرسال التقرير اليومي إلى تلغرام يدوياً." if ok else f"تعذر إرسال التقرير اليومي: {brain.tg.last_status}",
-                        "SYSTEM",
-                    )
-
-            await stream_manager.broadcast_state()
+            await execute_user_command(data)
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -2414,6 +2470,8 @@ HTML_UI = """<!DOCTYPE html>
       const [priceFlash, setPriceFlash] = useState("text-white");
       const prevPriceRef = useRef(null);
       const wsRef = useRef(null);
+      const wsActiveRef = useRef(false);
+      const fullLoadedRef = useRef(false);
 
       const [showZones, setShowZones] = useState(true);
       const [showVP, setShowVP] = useState(true);
@@ -2426,58 +2484,119 @@ HTML_UI = """<!DOCTYPE html>
       const [tgEnabledInput, setTgEnabledInput] = useState(true);
       const tgLoadedRef = useRef(false);
 
-      useEffect(() => {
-        let timer;
-        function connect() {
-          const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-          const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
-          wsRef.current = ws;
-
-          ws.onopen = () => setConnected(true);
-          ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            if (data.price !== undefined && data.price !== null && prevPriceRef.current !== null) {
-              if (data.price > prevPriceRef.current) {
-                setPriceFlash("text-emerald-400");
-                setTimeout(() => setPriceFlash("text-white"), 350);
-              } else if (data.price < prevPriceRef.current) {
-                setPriceFlash("text-rose-400");
-                setTimeout(() => setPriceFlash("text-white"), 350);
-              }
-            }
-            if (data.price !== undefined) prevPriceRef.current = data.price;
-
-            if (data.telegram && !tgLoadedRef.current) {
-              setTgChatInput(data.telegram.chat_id || "");
-              setTgEnabledInput(Boolean(data.telegram.enabled));
-              tgLoadedRef.current = true;
-            }
-
-            if (data.type === "INIT_SNAPSHOT") {
-              if (data.candles) setSnapshotCandles(data.candles);
-              if (data.ema_fast_series) setEmaFastSeries(data.ema_fast_series);
-              if (data.ema_slow_series) setEmaSlowSeries(data.ema_slow_series);
-              setState(prev => ({ ...prev, ...data }));
-            } else if (data.type === "TICK_UPDATE") {
-              if (data.candle) setLatestCandle(data.candle);
-              if (data.ema_fast_point) setEmaFastPoint(data.ema_fast_point);
-              if (data.ema_slow_point) setEmaSlowPoint(data.ema_slow_point);
-              setState(prev => ({ ...prev, ...data }));
-            }
-          };
-          ws.onclose = () => {
-            setConnected(false);
-            timer = setTimeout(connect, 2500);
-          };
+      const applyIncomingData = (data) => {
+        if (!data) return;
+        if (data.price !== undefined && data.price !== null && prevPriceRef.current !== null) {
+          if (data.price > prevPriceRef.current) {
+            setPriceFlash("text-emerald-400");
+            setTimeout(() => setPriceFlash("text-white"), 350);
+          } else if (data.price < prevPriceRef.current) {
+            setPriceFlash("text-rose-400");
+            setTimeout(() => setPriceFlash("text-white"), 350);
+          }
         }
-        connect();
-        return () => clearTimeout(timer);
+        if (data.price !== undefined) prevPriceRef.current = data.price;
+
+        if (data.telegram && !tgLoadedRef.current) {
+          setTgChatInput(data.telegram.chat_id || "");
+          setTgEnabledInput(Boolean(data.telegram.enabled));
+          tgLoadedRef.current = true;
+        }
+
+        if (data.type === "INIT_SNAPSHOT") {
+          if (data.candles && data.candles.length > 0) {
+            setSnapshotCandles(data.candles);
+            fullLoadedRef.current = true;
+          }
+          if (data.ema_fast_series) setEmaFastSeries(data.ema_fast_series);
+          if (data.ema_slow_series) setEmaSlowSeries(data.ema_slow_series);
+          setState(prev => ({ ...prev, ...data }));
+        } else if (data.type === "TICK_UPDATE") {
+          if (data.candle) setLatestCandle(data.candle);
+          if (data.ema_fast_point) setEmaFastPoint(data.ema_fast_point);
+          if (data.ema_slow_point) setEmaSlowPoint(data.ema_slow_point);
+          setState(prev => ({ ...prev, ...data }));
+        }
+      };
+
+      useEffect(() => {
+        let wsTimer;
+        let pollTimer;
+        let unmounted = false;
+
+        async function pollHttpFallback() {
+          if (unmounted || wsActiveRef.current) return;
+          try {
+            const needFull = !fullLoadedRef.current;
+            const res = await fetch(`/api/state?full=${needFull ? 'true' : 'false'}`);
+            if (res.ok) {
+              const data = await res.json();
+              setConnected(true);
+              applyIncomingData(data);
+            }
+          } catch (err) {
+            if (!wsActiveRef.current) setConnected(false);
+          }
+        }
+
+        function connectWs() {
+          if (unmounted) return;
+          try {
+            const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+            wsRef.current = ws;
+
+            ws.onopen = () => {
+              wsActiveRef.current = true;
+              setConnected(true);
+            };
+            ws.onmessage = (e) => {
+              try {
+                const data = JSON.parse(e.data);
+                applyIncomingData(data);
+              } catch (_) {}
+            };
+            ws.onclose = () => {
+              wsActiveRef.current = false;
+              wsTimer = setTimeout(connectWs, 6000);
+            };
+            ws.onerror = () => {
+              wsActiveRef.current = false;
+            };
+          } catch (_) {
+            wsActiveRef.current = false;
+          }
+        }
+
+        pollHttpFallback();
+        connectWs();
+        pollTimer = setInterval(pollHttpFallback, 1500);
+
+        return () => {
+          unmounted = true;
+          clearTimeout(wsTimer);
+          clearInterval(pollTimer);
+          if (wsRef.current) wsRef.current.close();
+        };
       }, []);
 
-      const sendCommand = (command, extra = {}) => {
+      const sendCommand = async (command, extra = {}) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({ command, ...extra }));
+          return;
         }
+        try {
+          const res = await fetch("/api/command", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command, ...extra }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (command === "RELOAD_HISTORY") fullLoadedRef.current = false;
+            applyIncomingData(data);
+          }
+        } catch (_) {}
       };
 
       const saveTelegramSettings = (e) => {
@@ -3233,6 +3352,16 @@ HTML_UI = """<!DOCTYPE html>
 """
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def serve_terminal():
     return HTMLResponse(content=HTML_UI)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", 8000)))
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, ws="websockets")
+    except Exception:
+        uvicorn.run(app, host="0.0.0.0", port=port)
+
